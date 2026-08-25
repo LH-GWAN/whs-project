@@ -4,6 +4,10 @@
 - AVI, strl에 이름 없이 그냥 txt 타입이라고만 나옴, 뭔지 모름 → **GPS_meatadata_GPRMC.py**
 - MP4(INAVI 등, moov/trak 구조) → **GPS_metadata_mp4_pvc1_Atext.py**
 
+# AVI_exception_lot_RIFF.py
+
+RIFF가 2개 이상 있을 경우, 슬랙 데이터 때문에 한번에 idx1을 찾기 어려운 경우가 있다. 이를 방지하고자 RIFF 가 2개 이상 있는 경우 내부 알고리즘을 통해 슬랙 데이터들을 제거하고 영상을 재추출하는 스크립트다.
+
 # GPS_metadata_avi.py 기준
 
 idx1 상대 offset 기준 자동 파싱 스크립트. idx1이 있다는 가정하에 만든거라 없으면 나가리(GPS Sample 1-3같은거)
