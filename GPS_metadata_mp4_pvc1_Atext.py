@@ -16,6 +16,8 @@ if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
 
 
 WARNINGS = []
+MAX_TABLE_ENTRIES = 1_000_000
+SUPPORTED_TEXT_HANDLERS = {b"text", b"sbtl", b"subt"}
 
 
 def warn(msg):
@@ -208,77 +210,93 @@ class StscEntry:
 
 
 def parse_stsc(f, stsc_box):
+    payload_len = stsc_box.size - stsc_box.header_size
+    if payload_len < 8:
+        warn(f"stsc @ 0x{stsc_box.start:X}: payload가 8바이트보다 짧음")
+        return []
     f.seek(stsc_box.payload_start)
     header = f.read(8)
-    entry_count = struct.unpack(">I", header[4:8])[0]
+    if len(header) < 8:
+        warn(f"stsc @ 0x{stsc_box.start:X}: 헤더 읽기 실패")
+        return []
+    declared = struct.unpack(">I", header[4:8])[0]
+    max_by_box = max(0, (stsc_box.end - (stsc_box.payload_start + 8)) // 12)
+    entry_count = min(declared, max_by_box, MAX_TABLE_ENTRIES)
+    if declared != entry_count:
+        warn(f"stsc @ 0x{stsc_box.start:X}: entry_count={declared}를 box 경계/안전 한도에 따라 {entry_count}로 제한")
     payload = f.read(entry_count * 12)
     entries = []
     prev_first_chunk = 0
     for i in range(entry_count):
-        if len(payload) < (i+1)*12:
-            warn(f"stsc @ 0x{stsc_box.start:X}: entry_count={entry_count}인데 "
-                 f"데이터가 부족함 (entry #{i+1})")
+        chunk = payload[i*12:(i+1)*12]
+        if len(chunk) < 12:
+            warn(f"stsc @ 0x{stsc_box.start:X}: entry #{i+1} 데이터 부족")
             break
-        first_chunk, spc, sdi = struct.unpack(">III", payload[i*12:(i+1)*12])
+        first_chunk, spc, sdi = struct.unpack(">III", chunk)
+        if first_chunk == 0 or spc == 0 or sdi == 0:
+            warn(f"stsc entry #{i+1}: 0 값(first_chunk={first_chunk}, samples_per_chunk={spc}, sdi={sdi}) - 무효 entry 건너뜀")
+            continue
         if first_chunk <= prev_first_chunk:
-            warn(f"stsc entry #{i+1}: first_chunk({first_chunk})가 이전 entry의 "
-                 f"first_chunk({prev_first_chunk})보다 크지 않음 - 순서 이상")
+            warn(f"stsc entry #{i+1}: first_chunk({first_chunk})가 이전 값({prev_first_chunk})보다 크지 않음 - 무효 entry 건너뜀")
+            continue
         prev_first_chunk = first_chunk
         entries.append(StscEntry(first_chunk, spc, sdi))
     return entries
 
-
 def parse_stsz(f, stsz_box):
+    payload_len = stsz_box.size - stsz_box.header_size
+    if payload_len < 12:
+        warn(f"stsz @ 0x{stsz_box.start:X}: payload가 12바이트보다 짧음")
+        return []
     f.seek(stsz_box.payload_start)
     header = f.read(12)
     if len(header) < 12:
         warn(f"stsz @ 0x{stsz_box.start:X}: 헤더 읽기 실패")
         return []
     sample_size = struct.unpack(">I", header[4:8])[0]
-    sample_count = struct.unpack(">I", header[8:12])[0]
-
+    declared = struct.unpack(">I", header[8:12])[0]
+    if declared > MAX_TABLE_ENTRIES:
+        warn(f"stsz @ 0x{stsz_box.start:X}: sample_count={declared}가 안전 한도({MAX_TABLE_ENTRIES}) 초과 - Track 파싱 중단")
+        return []
     if sample_size != 0:
-        return [sample_size] * sample_count
-
+        return [sample_size] * declared
+    max_by_box = max(0, (stsz_box.end - (stsz_box.payload_start + 12)) // 4)
+    sample_count = min(declared, max_by_box)
+    if declared != sample_count:
+        warn(f"stsz @ 0x{stsz_box.start:X}: sample_count={declared}, box 내부 실제 가능한 entry={sample_count}로 제한")
     raw = f.read(sample_count * 4)
-    if len(raw) < sample_count * 4:
-        warn(f"stsz @ 0x{stsz_box.start:X}: sample_count={sample_count}인데 "
-             f"개별 size 데이터가 부족함 (읽은 바이트={len(raw)})")
-        sample_count = len(raw) // 4
-        raw = raw[:sample_count * 4]
-    sizes = list(struct.unpack(f">{sample_count}I", raw)) if sample_count else []
-    return sizes
-
+    n = len(raw) // 4
+    return list(struct.unpack(f">{n}I", raw[:n*4])) if n else []
 
 def parse_chunk_offsets(f, stbl_children):
+    def _parse(box, width, kind):
+        payload_len = box.size - box.header_size
+        if payload_len < 8:
+            warn(f"{kind} @ 0x{box.start:X}: payload가 8바이트보다 짧음")
+            return []
+        f.seek(box.payload_start)
+        header = f.read(8)
+        if len(header) < 8:
+            warn(f"{kind} @ 0x{box.start:X}: 헤더 읽기 실패")
+            return []
+        declared = struct.unpack(">I", header[4:8])[0]
+        max_by_box = max(0, (box.end - (box.payload_start + 8)) // width)
+        count = min(declared, max_by_box, MAX_TABLE_ENTRIES)
+        if declared != count:
+            warn(f"{kind} @ 0x{box.start:X}: entry_count={declared}를 box 경계/안전 한도에 따라 {count}로 제한")
+        raw = f.read(count * width)
+        n = len(raw) // width
+        fmt = "Q" if width == 8 else "I"
+        return list(struct.unpack(f">{n}{fmt}", raw[:n*width])) if n else []
+
     stco = find_box(stbl_children, b"stco")
     co64 = find_box(stbl_children, b"co64")
-
     if co64 is not None:
-        f.seek(co64.payload_start)
-        header = f.read(8)
-        entry_count = struct.unpack(">I", header[4:8])[0]
-        raw = f.read(entry_count * 8)
-        n = len(raw) // 8
-        if n != entry_count:
-            warn(f"co64 @ 0x{co64.start:X}: entry_count={entry_count}, 실제 읽은 "
-                 f"entry={n}")
-        return list(struct.unpack(f">{n}Q", raw[:n*8])), "co64"
-
+        return _parse(co64, 8, "co64"), "co64"
     if stco is not None:
-        f.seek(stco.payload_start)
-        header = f.read(8)
-        entry_count = struct.unpack(">I", header[4:8])[0]
-        raw = f.read(entry_count * 4)
-        n = len(raw) // 4
-        if n != entry_count:
-            warn(f"stco @ 0x{stco.start:X}: entry_count={entry_count}, 실제 읽은 "
-                 f"entry={n}")
-        return list(struct.unpack(f">{n}I", raw[:n*4])), "stco"
-
+        return _parse(stco, 4, "stco"), "stco"
     warn("stco/co64 둘 다 없음 - Chunk offset을 알 수 없음")
     return [], None
-
 
 @dataclass
 class SampleInfo:
@@ -365,7 +383,7 @@ def parse_track(f, trak_box, track_number):
     ti.handler_type = handler_type
     ti.handler_name = handler_name
 
-    if handler_type != b"text":
+    if handler_type not in SUPPORTED_TEXT_HANDLERS:
         return ti
 
     ti.is_text_track = True
@@ -422,7 +440,7 @@ KEYWORD_CANDIDATES = [
     "latitude", "longitude", "speed",
 ]
 
-EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[ -~]*)")
+EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[^\x00\r\n;]*)")
 
 
 def decode_sample_text(raw_bytes):
@@ -436,121 +454,134 @@ def decode_sample_text(raw_bytes):
                 return text_bytes.decode("latin1", errors="replace"), True
 
     stripped = raw_bytes.rstrip(b"\x00")
-    if stripped and all(9 <= b < 127 or b in (10, 13) for b in stripped):
+    if stripped and all((32 <= b < 127) or b in (9, 10, 13) for b in stripped):
         return stripped.decode("ascii", errors="replace"), False
     return None, False
 
 
 def nmea_checksum_ok(sentence):
+    sentence = sentence.strip().lstrip("$")
     if "*" not in sentence:
         return None
     body, _, csum = sentence.partition("*")
     csum = csum.strip()
-    if len(csum) < 2:
-        return None
+    if len(csum) < 2 or not re.fullmatch(r"[0-9A-Fa-f]{2}.*", csum):
+        return False
     calc = 0
     for ch in body:
         calc ^= ord(ch)
-    try:
-        return f"{calc:02X}" == csum[:2].upper()
-    except ValueError:
-        return None
-
+    return f"{calc:02X}" == csum[:2].upper()
 
 def _dm_to_decimal(value_str, deg_digits, hemisphere, neg_hemi):
     if not value_str or len(value_str) <= deg_digits:
         return None
-    deg = int(value_str[:deg_digits])
-    minutes = float(value_str[deg_digits:])
+    allowed = {"N", "S"} if deg_digits == 2 else {"E", "W"}
+    if hemisphere not in allowed:
+        return None
+    try:
+        deg = int(value_str[:deg_digits]); minutes = float(value_str[deg_digits:])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(minutes) or not (0.0 <= minutes < 60.0):
+        return None
+    max_deg = 90 if deg_digits == 2 else 180
+    if not (0 <= deg <= max_deg) or (deg == max_deg and minutes != 0):
+        return None
     decimal = deg + minutes / 60.0
-    if hemisphere == neg_hemi:
-        decimal = -decimal
-    return decimal
-
+    return -decimal if hemisphere == neg_hemi else decimal
 
 def format_nmea_date(ddmmyy):
     if not ddmmyy or len(ddmmyy) != 6 or not ddmmyy.isdigit():
         return ddmmyy
-    dd, mm, yy = ddmmyy[0:2], ddmmyy[2:4], ddmmyy[4:6]
-    return f"20{yy}-{mm}-{dd}"
-
+    dd, mm, yy = int(ddmmyy[:2]), int(ddmmyy[2:4]), int(ddmmyy[4:6])
+    year = 1900 + yy if yy >= 80 else 2000 + yy
+    try:
+        import datetime as _dt
+        return _dt.date(year, mm, dd).isoformat()
+    except ValueError:
+        return ddmmyy
 
 def format_nmea_time(hhmmss):
     if not hhmmss or len(hhmmss) < 6:
         return hhmmss
-    hh, mm, ss = hhmmss[0:2], hhmmss[2:4], hhmmss[4:]
-    return f"{hh}:{mm}:{ss}"
-
+    try:
+        hh = int(hhmmss[:2]); mm = int(hhmmss[2:4]); ss = float(hhmmss[4:])
+    except (TypeError, ValueError, OverflowError):
+        return hhmmss
+    if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss < 60):
+        return hhmmss
+    return f"{hh:02d}:{mm:02d}:{hhmmss[4:]}"
 
 def parse_rmc(fields):
     if len(fields) < 10:
         return None
-    lat_str, lat_hemi = fields[3], fields[4]
-    lon_str, lon_hemi = fields[5], fields[6]
-    if not lat_str or not lon_str:
-        return None
-    lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
-    lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
+    lat = _dm_to_decimal(fields[3].strip(), 2, fields[4].strip().upper(), "S")
+    lon = _dm_to_decimal(fields[5].strip(), 3, fields[6].strip().upper(), "W")
     if lat is None or lon is None:
         return None
-    speed_knots = fields[7] if len(fields) > 7 else ""
-    mode_field = fields[12] if len(fields) > 12 else ""
-    mode = mode_field.split("*")[0] if mode_field else ""
-    return {
-        "lat": lat, "lon": lon,
-        "date": format_nmea_date(fields[9] if len(fields) > 9 else ""),
-        "utc_time": format_nmea_time(fields[1]), "status": fields[2],
-        "speed_knots": speed_knots,
-        "speed_kmh": (float(speed_knots) * 1.852) if speed_knots else None,
-        "track_deg": fields[8] if len(fields) > 8 else "",
-        "magvar": fields[10] if len(fields) > 10 else "",
-        "magvar_dir": fields[11] if len(fields) > 11 else "",
-        "mode": mode,
-    }
-
+    warnings = []
+    speed_knots = fields[7].strip() if len(fields) > 7 else ""
+    speed_kmh = None
+    if speed_knots:
+        try:
+            v = float(speed_knots)
+            if math.isfinite(v) and v >= 0: speed_kmh = v * 1.852
+            else: warnings.append("invalid_speed")
+        except (ValueError, OverflowError): warnings.append("invalid_speed")
+    status = fields[2].strip().upper() if len(fields) > 2 else ""
+    if status not in {"A", "V", ""}: warnings.append("invalid_status")
+    return {"lat":lat,"lon":lon,"date":format_nmea_date(fields[9].strip()),
+            "utc_time":format_nmea_time(fields[1].strip()),"status":status,
+            "status_valid":status=="A","speed_knots":speed_knots,"speed_kmh":speed_kmh,
+            "track_deg":fields[8].strip() if len(fields)>8 else "",
+            "magvar":fields[10].strip() if len(fields)>10 else "",
+            "magvar_dir":fields[11].strip().upper() if len(fields)>11 else "",
+            "mode":fields[12].strip().upper() if len(fields)>12 else "",
+            "parse_warnings":";".join(warnings)}
 
 def parse_gga(fields):
     if len(fields) < 10:
         return None
-    lat_str, lat_hemi = fields[2], fields[3]
-    lon_str, lon_hemi = fields[4], fields[5]
-    if not lat_str or not lon_str:
-        return None
-    lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
-    lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
+    lat = _dm_to_decimal(fields[2].strip(), 2, fields[3].strip().upper(), "S")
+    lon = _dm_to_decimal(fields[4].strip(), 3, fields[5].strip().upper(), "W")
     if lat is None or lon is None:
         return None
-    return {
-        "lat": lat, "lon": lon,
-        "date": "",
-        "utc_time": format_nmea_time(fields[1]), "status": fields[6],
-        "speed_knots": "", "speed_kmh": None, "track_deg": "",
-        "magvar": "", "magvar_dir": "", "mode": "",
-        "altitude_m": fields[9] if len(fields) > 9 else "",
-    }
-
+    quality = fields[6].strip() if len(fields)>6 else ""
+    return {"lat":lat,"lon":lon,"date":"","utc_time":format_nmea_time(fields[1].strip()),
+            "status":quality,"status_valid":quality.isdigit() and int(quality)>0,
+            "speed_knots":"","speed_kmh":None,"track_deg":"","magvar":"","magvar_dir":"","mode":"",
+            "altitude_m":fields[9].strip() if len(fields)>9 else "",
+            "parse_warnings":"" if quality.isdigit() else "invalid_fix_quality"}
 
 NMEA_PARSERS = {"RMC": parse_rmc, "GGA": parse_gga}
 
 
 def try_parse_nmea(line):
-    body = line[1:] if line.startswith("$") else line
+    if not isinstance(line, str):
+        return None
+    raw = line.strip("\x00\r\n\t ")
+    body_with_checksum = raw[1:] if raw.startswith("$") else raw
+    checksum_ok = nmea_checksum_ok(body_with_checksum)
+    body = body_with_checksum.split("*",1)[0]
     fields = body.split(",")
     if not fields or len(fields[0]) != 5:
         return None
-    talker, sentence_type = fields[0][:2], fields[0][2:]
+    talker, sentence_type = fields[0][:2], fields[0][2:].upper()
+    if not talker.isalpha():
+        return None
     parser = NMEA_PARSERS.get(sentence_type)
     if parser is None:
         return None
-    parsed = parser(fields)
+    try:
+        parsed = parser(fields)
+    except (ValueError, TypeError, OverflowError, IndexError) as exc:
+        warn(f"NMEA {sentence_type} 파싱 실패: {exc} - segment는 generic으로 보존")
+        return None
     if parsed is None:
         return None
-    parsed["talker"] = talker
-    parsed["sentence_type"] = sentence_type
-    parsed["raw"] = line
-    parsed["checksum_ok"] = nmea_checksum_ok(body)
+    parsed.update({"talker":talker,"sentence_type":sentence_type,"raw":raw,"checksum_ok":checksum_ok})
+    parsed["trusted"] = bool(parsed.get("status_valid", True) and checksum_ok is not False and not parsed.get("parse_warnings"))
     return parsed
-
 
 def split_segments(text):
     return [seg for seg in (s.strip() for s in text.split(";")) if seg]
@@ -715,6 +746,9 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
                     "track_deg": parsed.get("track_deg", ""),
                     "sentence_type": parsed["sentence_type"],
                     "checksum_ok": parsed["checksum_ok"],
+                    "status_valid": parsed.get("status_valid", ""),
+                    "trusted": parsed.get("trusted", ""),
+                    "parse_warnings": parsed.get("parse_warnings", ""),
                     "raw_sentence": parsed["raw"],
                 })
 
@@ -807,6 +841,7 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    WARNINGS.clear()
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
     filesize = os.path.getsize(args.input)
@@ -816,6 +851,8 @@ def main(argv=None):
 
     with open(args.input, "rb") as f:
         top_boxes = list(iter_boxes(f, 0, filesize, context="top-level"))
+        if find_box(top_boxes, b"moof") is not None:
+            warn("fragmented MP4(moof) 감지 - 현재 버전은 moov/stbl sample table 기반이며 moof/traf/trun은 해석하지 않음")
 
         info("=" * 60)
         info("MP4 FILE")
@@ -871,7 +908,7 @@ def main(argv=None):
                 warn(f"--track {m} 지정했지만 해당 번호는 text Track이 아니거나 존재하지 않음")
 
         if not text_tracks:
-            warn("handler_type == 'text' 인 Track을 하나도 찾지 못함(또는 --track 필터로 모두 제외됨)")
+            warn("지원 text/subtitle handler(text/sbtl/subt) Track을 하나도 찾지 못함(또는 --track 필터로 모두 제외됨)")
 
         if args.list_tracks:
             info("\n--list-tracks 모드: 추출 없이 종료")

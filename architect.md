@@ -45,7 +45,7 @@ AVI는 RIFF 컨테이너: `RIFF` → `LIST hdrl`(스트림 정의) / `LIST movi`
 4. **`parse_idx1`**: `idx1`을 16바이트 단위(`chunk_id, flags, offset, length`)로 파싱해서
    엔트리 리스트로 만듦. 이게 "movi 안 어디에 어떤 청크가 있는지"의 유일한 지도.
 5. **`stream_index_from_chunk_id`**: idx1 엔트리의 chunk_id 앞 2글자(`"02"` 등, 16진수)로
-   스트림 번호를 역산. AVI 표준상 chunk_id는 `<stream#2hex><type2char>`(예: `02st`=stream 2,
+   스트림 번호를 역산. AVI 표준상 chunk_id는 `<stream#2digits><type2char>`(예: `02st`=stream 2,
    subtype text) 형식이라 이걸로 idx1 엔트리를 스트림별로 묶음.
 6. **`detect_base_offset`**: idx1의 offset이 절대 오프셋인지, movi FourCC 위치 기준인지,
    movi 데이터 시작 기준인지 장비마다 다름. 세 후보(A: movi FourCC 위치, B: A+4, C: 0)에
@@ -63,10 +63,10 @@ AVI는 RIFF 컨테이너: `RIFF` → `LIST hdrl`(스트림 정의) / `LIST movi`
    순서(idx1 순서) 그대로 훑으면서, `base_offset + idx_offset`에서 실제 청크를 읽음.
    `validate_chunk`가 매 엔트리마다 ID 일치/크기 일치/파일 범위 안에 있는지 검증하고
    `OK`/`ID_MISMATCH`/`SIZE_MISMATCH`/`OUT_OF_RANGE` 태그를 붙임 — 문제 있어도 멈추지
-   않고 계속 진행, 결과는 `index.csv`에 전부 기록됨(raw carving은 "일단 다 뽑고 검증
-   결과는 로그로 남긴다"는 원칙).
-   - payload는 청크 헤더 8바이트를 뺀 나머지 그대로 저장(`chunks/*.bin`) + 스트림 전체를
-     이어붙인 `{prefix}_concat.bin`도 별도 생성. **raw는 무조건 보존**.
+   않고 계속 진행, 결과는 `index.csv`에 전부 기록됨. **자동 추출/디코딩은 `OK` 엔트리에만 수행**해
+   잘못된 idx1 offset을 GPS/SENS로 오인하는 것을 막음.
+   - 검증 `OK` payload는 청크 헤더 8바이트를 뺀 나머지 그대로 저장(`chunks/*.bin`) + 스트림 전체를
+     이어붙인 `{prefix}_concat.bin`도 별도 생성.
 3. **자동 분류** (`classify_payload`): 각 payload를 4가지로 판정:
    - `nmea_text`: payload 안 어디에든 `EMBEDDED_NMEA_RE`(정규식 `\$?[A-Z]{2}(?:RMC|GGA)...`)
      로 NMEA 문장이 섞여 있으면 매치.
@@ -169,9 +169,9 @@ AVI와 컨테이너가 완전히 다름(ISO BMFF: `moov` → `trak` → `mdia` �
 2. 최상위에서 `ftyp`(브랜드 정보, 참고용)와 `moov`(전체 메타데이터 루트)를 찾음.
    `moov` 안 `trak`마다 `parse_track` 호출.
 3. **`parse_track`**: `trak` → `mdia` → `minf`/`hdlr` 순으로 내려가서 `hdlr`의
-   `handler_type`(4바이트, `vide`/`soun`/`text` 등)을 확인. **`text`가 아니면 그 자리에서
-   중단**(vide/soun 트랙은 stbl까지 안 내려감 — 원칙대로 다른 트랙 payload는 안 건드림).
-4. `text` 트랙만 `minf` → `stbl`까지 내려가서 `stsd`(샘플 타입 정의)/`stsc`(청크당
+   `handler_type`(4바이트, `vide`/`soun`/`text`/`sbtl` 등)을 확인. **지원 text/subtitle handler
+   (`text`/`sbtl`/`subt`)가 아니면 그 자리에서 중단**(vide/soun 트랙은 stbl까지 안 내려감).
+4. 지원 text/subtitle 트랙만 `minf` → `stbl`까지 내려가서 `stsd`(샘플 타입 정의)/`stsc`(청크당
    샘플 개수 규칙)/`stsz`(샘플별 크기)/`stco` 또는 `co64`(청크 절대 offset, 64bit면
    co64) 네 박스를 파싱.
 5. **`compute_sample_positions`**: `stsc`의 "이 청크 번호부터는 청크당 샘플 N개" 규칙을
@@ -206,7 +206,7 @@ AVI와 컨테이너가 완전히 다름(ISO BMFF: `moov` → `trak` → `mdia` �
 <출력폴더>/
 ├── track_table.csv                     전체 Track: handler/이름/stsd타입/샘플수
 ├── warnings.log
-└── TRACK<N>_TEXT/                      handler_type=='text'인 Track마다 (N은 전체 순번)
+└── TRACK<N>_TEXT/                      지원 handler(text/sbtl/subt) Track마다 (N은 전체 순번)
     ├── index.csv                        Sample별 chunk/offset/size/validation
     ├── coordinates.csv/.txt             GPRMC/GPGGA 인식된 것만
     ├── sensor_values.csv                gsensor 세그먼트 원본 필드 그대로 (⚠ 비공식)
@@ -216,7 +216,7 @@ AVI와 컨테이너가 완전히 다름(ISO BMFF: `moov` → `trak` → `mdia` �
 ```
 
 CLI 옵션: `--list-tracks`(목록만), `--dry-run`(파일 미생성), `--extract`(Sample .bin 저장),
-`--track N`(특정 text Track 번호만 처리).
+`--track N`(특정 지원 text/subtitle Track 번호만 처리).
 
 ---
 
@@ -257,11 +257,12 @@ RIFF 헤더가 한 파일에 겹쳐 남는 경우, `idx1`이 여러 개 나와�
 
 ## 공통 설계 원칙
 
-- **raw는 항상 보존**한다 — 디코딩 결과가 의심스러우면 `chunks/*.bin`,
-  `*_concat.bin`(AVI), `chunks/*.bin`(MP4, `--extract` 시)으로 원본 대조 가능.
-- **파싱 실패는 프로그램을 죽이지 않고 로그로 남긴다** — `WARNINGS` 리스트에 쌓아서
+- **검증에 통과한 raw는 그대로 보존**한다 — 디코딩 결과가 의심스러우면 `chunks/*.bin`,
+  `*_concat.bin`(AVI), `chunks/*.bin`(MP4, `--extract` 시)으로 원본 대조 가능. AVI의 validation
+  mismatch 엔트리는 false positive 방지를 위해 자동 추출하지 않고 `index.csv`에 위치/사유만 남긴다.
+- **지원되는 NMEA 레코드의 값 변환 실패는 프로그램을 중단하지 않고 해당 레코드를 미분류/경고 처리한다** — `WARNINGS` 리스트에 쌓아서
   `warnings.log`로 출력, 문제 있는 엔트리/청크는 건너뛰고 나머지는 계속 처리.
-- **NMEA(GPRMC/GPGGA)는 공개 표준 그대로**라 세 스크립트 모두 안전하게 신뢰 가능.
+- **NMEA(GPRMC/GPGGA)는 표준 필드 형식을 기준으로 파싱**하지만, 실제 파일은 손상/비표준 값이 있을 수 있다. 좌표 범위·hemisphere·status/checksum·값 변환을 검증하고 `trusted`/`parse_warnings`를 함께 기록한다.
 - **float32 벡터(SENS/sensor_values)와 MP4 gsensor 필드는 공식 스펙이 아닌 관찰 기반
   추정** — 값 범위(±50 이내)나 필드 개수로 판단한 것이라 다른 장비 파일에서 같은
   패턴이 나와도 곧이곧대로 믿지 말 것.
