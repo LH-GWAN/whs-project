@@ -36,7 +36,7 @@ SAMPLE_ENTRIES_FOR_BASE_DETECT = 8
 MAX_IDX1_ENTRIES = 5_000_000
 
 DECODE_MIN_FRACTION = 0.8
-EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[^\x00\r\n;]*)")
+EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[ -~]*)")
 FLOAT_VECTOR_MIN_N = 2
 FLOAT_VECTOR_MAX_N = 8
 FLOAT_VECTOR_MAX_ABS = 50.0
@@ -779,7 +779,7 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
         seq_counters[stream.index] += 1
 
         output_file = ""
-        if reasons == ["OK"]:
+        if "OUT_OF_RANGE" not in reasons:
             payload = bytes(mm[payload_offset:payload_offset + e["length"]])
 
             if preview_printed[stream.index] < 3:
@@ -807,49 +807,57 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
             bytes_per_stream[stream.index] += e["length"]
             chunks_per_stream[stream.index] += 1
 
-            kind, value = classify_payload(payload)
-            classify_counts[stream.index][kind] += 1
-            if kind in ("nmea_text", "generic_text"):
-                parsed = try_parse_nmea(value)
-                if parsed is not None:
-                    speed_kmh = parsed.get("speed_kmh")
-                    coord_rows_by_stream[stream.index].append({
-                        "date": parsed.get("date", ""),
-                        "utc_time": parsed.get("utc_time", ""),
-                        "status": parsed.get("status", ""),
-                        "latitude": f"{parsed['lat']:.6f}",
-                        "longitude": f"{parsed['lon']:.6f}",
-                        "speed_knots": parsed.get("speed_knots", ""),
-                        "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
-                        "track_deg": parsed.get("track_deg", ""),
-                        "magvar": parsed.get("magvar", ""),
-                        "magvar_dir": parsed.get("magvar_dir", ""),
-                        "mode": parsed.get("mode", ""),
-                        "checksum_ok": parsed["checksum_ok"],
-                        "status_valid": parsed.get("status_valid", ""),
-                        "trusted": parsed.get("trusted", ""),
-                        "parse_warnings": parsed.get("parse_warnings", ""),
+            if reasons != ["OK"]:
+                # raw는 그대로 보존하되, ID/SIZE가 선언과 다른 청크는 base offset이나
+                # 파일 구조 추정이 이 위치에서 틀렸을 가능성이 있어 자동 디코딩(좌표/센서
+                # 값 산출)은 건너뛰고 raw만 남김 - 잘못된 좌표가 만들어지는 걸 방지.
+                warn(f"엔트리 #{seq} (stream={stream.index}, {e['chunk_id']!r}) "
+                     f"validation={status} - raw는 보존하지만 신뢰할 수 없어 자동 디코딩은 생략, "
+                     f"chunk_offset=0x{chunk_offset:X}")
+            else:
+                kind, value = classify_payload(payload)
+                classify_counts[stream.index][kind] += 1
+                if kind in ("nmea_text", "generic_text"):
+                    parsed = try_parse_nmea(value)
+                    if parsed is not None:
+                        speed_kmh = parsed.get("speed_kmh")
+                        coord_rows_by_stream[stream.index].append({
+                            "date": parsed.get("date", ""),
+                            "utc_time": parsed.get("utc_time", ""),
+                            "status": parsed.get("status", ""),
+                            "latitude": f"{parsed['lat']:.6f}",
+                            "longitude": f"{parsed['lon']:.6f}",
+                            "speed_knots": parsed.get("speed_knots", ""),
+                            "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
+                            "track_deg": parsed.get("track_deg", ""),
+                            "magvar": parsed.get("magvar", ""),
+                            "magvar_dir": parsed.get("magvar_dir", ""),
+                            "mode": parsed.get("mode", ""),
+                            "checksum_ok": parsed["checksum_ok"],
+                            "status_valid": parsed.get("status_valid", ""),
+                            "trusted": parsed.get("trusted", ""),
+                            "parse_warnings": parsed.get("parse_warnings", ""),
+                            "sequence": seq,
+                            "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
+                            "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
+                            "sentence_type": parsed["sentence_type"],
+                            "raw_sentence": parsed["raw"],
+                        })
+                    elif value:
+                        unparsed_by_stream[stream.index].append((seq, value))
+                elif kind == "float_vector":
+                    row = {
                         "sequence": seq,
                         "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
                         "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
-                        "sentence_type": parsed["sentence_type"],
-                        "raw_sentence": parsed["raw"],
-                    })
-                elif value:
-                    unparsed_by_stream[stream.index].append((seq, value))
-            elif kind == "float_vector":
-                row = {
-                    "sequence": seq,
-                    "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
-                    "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
-                }
-                row["vector_length"] = len(value)
-                if len(value) == 3:
-                    row["x"], row["y"], row["z"] = (f"{v:.6f}" for v in value)
-                else:
-                    for i, v in enumerate(value):
-                        row[f"value_{i}"] = f"{v:.6f}"
-                sensor_rows_by_stream[stream.index].append(row)
+                    }
+                    row["vector_length"] = len(value)
+                    if len(value) == 3:
+                        row["x"], row["y"], row["z"] = (f"{v:.6f}" for v in value)
+                    else:
+                        for i, v in enumerate(value):
+                            row[f"value_{i}"] = f"{v:.6f}"
+                    sensor_rows_by_stream[stream.index].append(row)
         else:
             warn(f"엔트리 #{seq} (stream={stream.index}, {e['chunk_id']!r}) "
                  f"validation={status} - 안전을 위해 payload 추출/자동 디코딩 생략, "

@@ -139,6 +139,7 @@ GPS_Sample_2/
 - MP4 Sample 맨 앞 "2바이트 길이 프리픽스"도 마찬가지로 QuickTime text sample 관례를 보고
   넣은 거고, `길이+2 == Sample 크기`가 실제로 맞는지 매번 검증한 다음에만 씀 — 안 맞는 장비면
   자동으로 raw 텍스트 후보 취급으로 빠짐
-- 구조/offset/크기가 `OK`로 검증된 레코드는 raw를 그대로 보존함 (chunks/*.bin, `{prefix}_concat.bin` 또는
-  raw_chunks/*.bin, raw_concat.bin, MP4 쪽은 --extract 옵션). AVI에서 `ID_MISMATCH`/`SIZE_MISMATCH`/
-  `OUT_OF_RANGE`인 idx1 entry는 false positive 방지를 위해 자동 추출·디코딩하지 않고 `index.csv`에만 남김.
+- raw는 `OUT_OF_RANGE`만 아니면 항상 그대로 보존함 (chunks/*.bin, `{prefix}_concat.bin` 또는
+  raw_chunks/*.bin, raw_concat.bin, MP4 쪽은 --extract 옵션). AVI에서 `ID_MISMATCH`/`SIZE_MISMATCH`인
+  idx1 entry도 raw는 뽑되, false positive 방지를 위해 자동 디코딩(분류/좌표 산출)만 생략하고
+  `index.csv`에 사유를 남김. `OUT_OF_RANGE`(파일 범위를 벗어난 entry)만 raw 추출 자체를 생략함.

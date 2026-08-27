@@ -440,7 +440,7 @@ KEYWORD_CANDIDATES = [
     "latitude", "longitude", "speed",
 ]
 
-EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[^\x00\r\n;]*)")
+EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[ -~]*)")
 
 
 def decode_sample_text(raw_bytes):

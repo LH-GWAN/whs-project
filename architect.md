@@ -63,10 +63,12 @@ AVI는 RIFF 컨테이너: `RIFF` → `LIST hdrl`(스트림 정의) / `LIST movi`
    순서(idx1 순서) 그대로 훑으면서, `base_offset + idx_offset`에서 실제 청크를 읽음.
    `validate_chunk`가 매 엔트리마다 ID 일치/크기 일치/파일 범위 안에 있는지 검증하고
    `OK`/`ID_MISMATCH`/`SIZE_MISMATCH`/`OUT_OF_RANGE` 태그를 붙임 — 문제 있어도 멈추지
-   않고 계속 진행, 결과는 `index.csv`에 전부 기록됨. **자동 추출/디코딩은 `OK` 엔트리에만 수행**해
-   잘못된 idx1 offset을 GPS/SENS로 오인하는 것을 막음.
-   - 검증 `OK` payload는 청크 헤더 8바이트를 뺀 나머지 그대로 저장(`chunks/*.bin`) + 스트림 전체를
-     이어붙인 `{prefix}_concat.bin`도 별도 생성.
+   않고 계속 진행, 결과는 `index.csv`에 전부 기록됨. **raw 추출은 `OUT_OF_RANGE`만 아니면
+   항상 수행**하고, **자동 디코딩(분류/좌표·센서값 산출)만 `OK` 엔트리로 제한**해 잘못된
+   idx1 offset에서 나온 데이터를 GPS 좌표로 오인하는 것을 막음(raw는 그대로 남으므로
+   ID_MISMATCH/SIZE_MISMATCH 청크도 원본 대조는 항상 가능).
+   - payload는 `OUT_OF_RANGE`가 아니라면 청크 헤더 8바이트를 뺀 나머지 그대로 저장
+     (`chunks/*.bin`) + 스트림 전체를 이어붙인 `{prefix}_concat.bin`도 별도 생성.
 3. **자동 분류** (`classify_payload`): 각 payload를 4가지로 판정:
    - `nmea_text`: payload 안 어디에든 `EMBEDDED_NMEA_RE`(정규식 `\$?[A-Z]{2}(?:RMC|GGA)...`)
      로 NMEA 문장이 섞여 있으면 매치.
@@ -257,9 +259,10 @@ RIFF 헤더가 한 파일에 겹쳐 남는 경우, `idx1`이 여러 개 나와�
 
 ## 공통 설계 원칙
 
-- **검증에 통과한 raw는 그대로 보존**한다 — 디코딩 결과가 의심스러우면 `chunks/*.bin`,
-  `*_concat.bin`(AVI), `chunks/*.bin`(MP4, `--extract` 시)으로 원본 대조 가능. AVI의 validation
-  mismatch 엔트리는 false positive 방지를 위해 자동 추출하지 않고 `index.csv`에 위치/사유만 남긴다.
+- **raw는 항상 그대로 보존**한다 — 디코딩 결과가 의심스러우면 `chunks/*.bin`,
+  `*_concat.bin`(AVI), `chunks/*.bin`(MP4, `--extract` 시)으로 원본 대조 가능. AVI의
+  ID_MISMATCH/SIZE_MISMATCH 엔트리도 raw는 그대로 뽑되, false positive 방지를 위해
+  자동 디코딩(분류/좌표 산출)만 생략하고 `index.csv`에 사유를 남긴다.
 - **지원되는 NMEA 레코드의 값 변환 실패는 프로그램을 중단하지 않고 해당 레코드를 미분류/경고 처리한다** — `WARNINGS` 리스트에 쌓아서
   `warnings.log`로 출력, 문제 있는 엔트리/청크는 건너뛰고 나머지는 계속 처리.
 - **NMEA(GPRMC/GPGGA)는 표준 필드 형식을 기준으로 파싱**하지만, 실제 파일은 손상/비표준 값이 있을 수 있다. 좌표 범위·hemisphere·status/checksum·값 변환을 검증하고 `trusted`/`parse_warnings`를 함께 기록한다.

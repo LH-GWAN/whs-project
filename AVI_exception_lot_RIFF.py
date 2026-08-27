@@ -49,8 +49,14 @@ def _iter_valid_idx1_candidates(mm):
         if idx < 0:
             break
         size = _u32le(mm, idx + 4)
-        if size is not None and size >= 16 and size % 16 == 0 and idx + 8 + size <= len(mm):
-            yield idx, size
+        if size is not None and size >= 16:
+            # 선언된 size가 16의 배수가 아니거나 파일 끝을 넘는 경우(마지막 엔트리가
+            # 잘린 흔한 손상 형태) 거부하지 않고 사용 가능한 만큼만 잘라서 씀.
+            available = max(len(mm) - (idx + 8), 0)
+            usable = min(size, available)
+            usable -= usable % 16
+            if usable >= 16:
+                yield idx, usable
         pos = idx + 4
 
 
@@ -176,6 +182,7 @@ def fix_blackbox_video(file_path, output_path):
                     out.write(block)
                     remaining -= len(block)
 
+                idx1_out_pos = out.tell()
                 src.seek(target_idx_offset)
                 remaining = 8 + target_idx_size
                 while remaining:
@@ -185,6 +192,12 @@ def fix_blackbox_video(file_path, output_path):
                         return False
                     out.write(block)
                     remaining -= len(block)
+
+                # idx1 헤더의 size 필드는 원본 선언값을 그대로 복사한 것이므로, 잘린
+                # 후보(usable < 원본 선언 size)였던 경우 실제로 쓴 바이트 수(target_idx_size)로
+                # 다시 덮어써서 헤더/실제 길이 불일치를 방지한다.
+                out.seek(idx1_out_pos + 4)
+                out.write(target_idx_size.to_bytes(4, "little"))
 
                 out.seek(movi_start + 4)
                 out.write(new_movi_size.to_bytes(4, "little"))
