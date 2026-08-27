@@ -9,136 +9,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import GPS_metadata_avi as carve
 
 
-def looks_like_text_record(payload, min_text_len=4):
-    nul_idx = payload.find(b"\x00")
-    text_part = payload if nul_idx == -1 else payload[:nul_idx]
-    pad_part = b"" if nul_idx == -1 else payload[nul_idx:]
+def looks_like_text_record(*args, **kwargs):
+    return carve.looks_like_text_record(*args, **kwargs)
 
-    if len(text_part) < min_text_len:
-        return False
-    if not all(32 <= b < 127 for b in text_part):
-        return False
-    if any(b != 0 for b in pad_part):
-        return False
-    return True
+def decode_text_record(*args, **kwargs):
+    return carve.decode_text_record(*args, **kwargs)
 
+def nmea_checksum_ok(*args, **kwargs):
+    return carve.nmea_checksum_ok(*args, **kwargs)
 
-def decode_text_record(payload):
-    nul_idx = payload.find(b"\x00")
-    text_part = payload if nul_idx == -1 else payload[:nul_idx]
-    return text_part.decode("ascii", errors="replace")
+def _dm_to_decimal(*args, **kwargs):
+    return carve._dm_to_decimal(*args, **kwargs)
 
+def format_nmea_date(*args, **kwargs):
+    return carve.format_nmea_date(*args, **kwargs)
 
-def nmea_checksum_ok(sentence):
-    if "*" not in sentence:
-        return None
-    body, _, csum = sentence.partition("*")
-    csum = csum.strip()
-    if len(csum) < 2:
-        return None
-    calc = 0
-    for ch in body:
-        calc ^= ord(ch)
-    try:
-        return f"{calc:02X}" == csum[:2].upper()
-    except ValueError:
-        return None
+def format_nmea_time(*args, **kwargs):
+    return carve.format_nmea_time(*args, **kwargs)
 
+def parse_rmc(*args, **kwargs):
+    return carve.parse_rmc(*args, **kwargs)
 
-def _dm_to_decimal(value_str, deg_digits, hemisphere, neg_hemi):
-    if not value_str or len(value_str) <= deg_digits:
-        return None
-    deg = int(value_str[:deg_digits])
-    minutes = float(value_str[deg_digits:])
-    decimal = deg + minutes / 60.0
-    if hemisphere == neg_hemi:
-        decimal = -decimal
-    return decimal
-
-
-def format_nmea_date(ddmmyy):
-    if not ddmmyy or len(ddmmyy) != 6 or not ddmmyy.isdigit():
-        return ddmmyy
-    dd, mm, yy = ddmmyy[0:2], ddmmyy[2:4], ddmmyy[4:6]
-    return f"20{yy}-{mm}-{dd}"
-
-
-def format_nmea_time(hhmmss):
-    if not hhmmss or len(hhmmss) < 6:
-        return hhmmss
-    hh, mm, ss = hhmmss[0:2], hhmmss[2:4], hhmmss[4:]
-    return f"{hh}:{mm}:{ss}"
-
-
-def parse_rmc(fields):
-    if len(fields) < 10:
-        return None
-    lat_str, lat_hemi = fields[3], fields[4]
-    lon_str, lon_hemi = fields[5], fields[6]
-    if not lat_str or not lon_str:
-        return None
-    lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
-    lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
-    if lat is None or lon is None:
-        return None
-    speed_knots = fields[7] if len(fields) > 7 else ""
-    mode_field = fields[12] if len(fields) > 12 else ""
-    mode = mode_field.split("*")[0] if mode_field else ""
-    return {
-        "lat": lat, "lon": lon,
-        "date": format_nmea_date(fields[9] if len(fields) > 9 else ""),
-        "utc_time": format_nmea_time(fields[1]), "status": fields[2],
-        "speed_knots": speed_knots,
-        "speed_kmh": (float(speed_knots) * 1.852) if speed_knots else None,
-        "track_deg": fields[8] if len(fields) > 8 else "",
-        "magvar": fields[10] if len(fields) > 10 else "",
-        "magvar_dir": fields[11] if len(fields) > 11 else "",
-        "mode": mode,
-    }
-
-
-def parse_gga(fields):
-    if len(fields) < 10:
-        return None
-    lat_str, lat_hemi = fields[2], fields[3]
-    lon_str, lon_hemi = fields[4], fields[5]
-    if not lat_str or not lon_str:
-        return None
-    lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
-    lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
-    if lat is None or lon is None:
-        return None
-    return {
-        "lat": lat, "lon": lon,
-        "date": "",
-        "utc_time": format_nmea_time(fields[1]), "status": fields[6],
-        "speed_knots": "", "speed_kmh": None, "track_deg": "",
-        "magvar": "", "magvar_dir": "", "mode": "",
-        "altitude_m": fields[9] if len(fields) > 9 else "",
-    }
-
+def parse_gga(*args, **kwargs):
+    return carve.parse_gga(*args, **kwargs)
 
 NMEA_PARSERS = {"RMC": parse_rmc, "GGA": parse_gga}
 
 
-def try_parse_nmea(line):
-    body = line[1:] if line.startswith("$") else line
-    fields = body.split(",")
-    if not fields or len(fields[0]) != 5:
-        return None
-    talker, sentence_type = fields[0][:2], fields[0][2:]
-    parser = NMEA_PARSERS.get(sentence_type)
-    if parser is None:
-        return None
-    parsed = parser(fields)
-    if parsed is None:
-        return None
-    parsed["talker"] = talker
-    parsed["sentence_type"] = sentence_type
-    parsed["raw"] = line
-    parsed["checksum_ok"] = nmea_checksum_ok(body)
-    return parsed
-
+def try_parse_nmea(*args, **kwargs):
+    return carve.try_parse_nmea(*args, **kwargs)
 
 def sniff_stream_is_text(mm, entries, base_offset, sample_size=8, min_fraction=0.8):
     sample = entries[:sample_size]
@@ -149,7 +48,7 @@ def sniff_stream_is_text(mm, entries, base_offset, sample_size=8, min_fraction=0
     for e in sample:
         chunk_offset = base_offset + e["idx_offset"]
         reasons, payload_offset, _ = carve.validate_chunk(mm, chunk_offset, e)
-        if "OUT_OF_RANGE" in reasons:
+        if reasons != ["OK"]:
             continue
         checked += 1
         payload = bytes(mm[payload_offset:payload_offset + e["length"]])
@@ -179,8 +78,9 @@ def process_stream(mm, out_dir, stream, entries, base_offset, label):
         for seq, e in enumerate(entries):
             chunk_offset = base_offset + e["idx_offset"]
             reasons, payload_offset, header_size = carve.validate_chunk(mm, chunk_offset, e)
-            if "OUT_OF_RANGE" in reasons:
-                carve.warn(f"[{display_label}] entry #{seq} OUT_OF_RANGE - 건너뜀 "
+            if reasons != ["OK"]:
+                validation_text = "|".join(reasons)
+                carve.warn(f"[{display_label}] entry #{seq} validation={validation_text} - 건너뜀 "
                            f"(chunk_offset=0x{chunk_offset:X})")
                 continue
 
@@ -213,6 +113,9 @@ def process_stream(mm, out_dir, stream, entries, base_offset, label):
                     "magvar_dir": parsed.get("magvar_dir", ""),
                     "mode": parsed.get("mode", ""),
                     "checksum_ok": parsed["checksum_ok"],
+                    "status_valid": parsed.get("status_valid", ""),
+                    "trusted": parsed.get("trusted", ""),
+                    "parse_warnings": parsed.get("parse_warnings", ""),
                     "sequence": seq,
                     "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
                     "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
@@ -232,7 +135,7 @@ def process_stream(mm, out_dir, stream, entries, base_offset, label):
         fieldnames = [
             "date", "utc_time", "status", "latitude", "longitude",
             "speed_knots", "speed_kmh", "track_deg", "magvar", "magvar_dir",
-            "mode", "checksum_ok",
+            "mode", "checksum_ok", "status_valid", "trusted", "parse_warnings",
             "sequence", "idx1_entry_offset", "chunk_id", "sentence_type", "raw_sentence",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -261,6 +164,7 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    carve.WARNINGS.clear()
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
     carve.assert_riff_file(args.input)

@@ -33,9 +33,10 @@ ANCHOR_SAMPLE_IDX_OFFSET = 0x04
 ANCHOR_EXPECTED_ABS_CHUNK_OFFSET = 0x100C
 
 SAMPLE_ENTRIES_FOR_BASE_DETECT = 8
+MAX_IDX1_ENTRIES = 5_000_000
 
 DECODE_MIN_FRACTION = 0.8
-EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[ -~]*)")
+EMBEDDED_NMEA_RE = re.compile(rb"\$?([A-Z]{2}(?:RMC|GGA)[^\x00\r\n;]*)")
 FLOAT_VECTOR_MIN_N = 2
 FLOAT_VECTOR_MAX_N = 8
 FLOAT_VECTOR_MAX_ABS = 50.0
@@ -240,13 +241,24 @@ def parse_hdrl(mm, hdrl_chunk):
 
 def parse_idx1(mm, idx1_start, idx1_size):
     entries = []
-    usable = idx1_size - (idx1_size % 16)
-    if usable != idx1_size:
-        warn(f"idx1 size(0x{idx1_size:X})가 16의 배수가 아님 - 마지막 잘린 엔트리 버림")
-    n = usable // 16
+    if idx1_start < 0 or idx1_start > len(mm):
+        warn(f"idx1 시작 위치(0x{idx1_start:X})가 파일 범위를 벗어남")
+        return entries
+    available = max(0, len(mm) - idx1_start)
+    bounded_size = min(idx1_size, available)
+    if bounded_size != idx1_size:
+        warn(f"idx1 선언 size(0x{idx1_size:X})가 파일 경계를 넘어 {bounded_size}바이트로 제한")
+    usable = bounded_size - (bounded_size % 16)
+    if usable != bounded_size:
+        warn(f"idx1 size(0x{bounded_size:X})가 16의 배수가 아님 - 마지막 잘린 엔트리 버림")
+    n = min(usable // 16, MAX_IDX1_ENTRIES)
+    if usable // 16 > MAX_IDX1_ENTRIES:
+        warn(f"idx1 entry 개수가 안전 한도({MAX_IDX1_ENTRIES})를 넘어 이후 entry는 분석하지 않음")
     for i in range(n):
         off = idx1_start + i * 16
         entry = bytes(mm[off:off + 16])
+        if len(entry) < 16:
+            break
         chunk_id = entry[0:4]
         flags = int.from_bytes(entry[4:8], "little")
         idx_offset = int.from_bytes(entry[8:12], "little")
@@ -259,12 +271,16 @@ def parse_idx1(mm, idx1_start, idx1_size):
 
 
 def stream_index_from_chunk_id(chunk_id):
-    prefix = chunk_id[0:2]
+    """AVI chunk id의 앞 두 자리(00~99)를 10진 stream number로 해석한다."""
+    if not isinstance(chunk_id, (bytes, bytearray)) or len(chunk_id) < 2:
+        return None
+    prefix = bytes(chunk_id[:2])
+    if not all(48 <= b <= 57 for b in prefix):
+        return None
     try:
-        return int(prefix.decode("ascii"), 16)
+        return int(prefix.decode("ascii"), 10)
     except (UnicodeDecodeError, ValueError):
         return None
-
 
 def build_stream_table(dw_streams, streams, idx1_entries):
     by_index = {s.index: s for s in streams}
@@ -502,24 +518,24 @@ def make_unique_labels(selected_streams):
 
 
 def looks_like_text_record(payload, min_text_len=4):
+    """NUL padding을 허용하되 본문에는 printable ASCII와 CR/LF/TAB만 허용한다."""
     nul_idx = payload.find(b"\x00")
     text_part = payload if nul_idx == -1 else payload[:nul_idx]
     pad_part = b"" if nul_idx == -1 else payload[nul_idx:]
+    text_part = text_part.rstrip(b"\r\n\t ")
 
     if len(text_part) < min_text_len:
         return False
-    if not all(32 <= b < 127 for b in text_part):
+    if not all((32 <= b < 127) or b in (9, 10, 13) for b in text_part):
         return False
     if any(b != 0 for b in pad_part):
         return False
     return True
 
-
 def decode_text_record(payload):
     nul_idx = payload.find(b"\x00")
     text_part = payload if nul_idx == -1 else payload[:nul_idx]
-    return text_part.decode("ascii", errors="replace")
-
+    return text_part.rstrip(b"\r\n\t ").decode("ascii", errors="replace")
 
 def find_embedded_nmea_text(payload):
     m = EMBEDDED_NMEA_RE.search(payload)
@@ -556,115 +572,164 @@ def classify_payload(payload):
 
 
 def nmea_checksum_ok(sentence):
+    """NMEA checksum을 검증한다. checksum이 없으면 None, 형식이 잘못되면 False."""
+    sentence = sentence.strip().lstrip("$")
     if "*" not in sentence:
         return None
     body, _, csum = sentence.partition("*")
     csum = csum.strip()
-    if len(csum) < 2:
-        return None
+    if len(csum) < 2 or not re.fullmatch(r"[0-9A-Fa-f]{2}.*", csum):
+        return False
     calc = 0
     for ch in body:
         calc ^= ord(ch)
-    try:
-        return f"{calc:02X}" == csum[:2].upper()
-    except ValueError:
-        return None
-
+    return f"{calc:02X}" == csum[:2].upper()
 
 def _dm_to_decimal(value_str, deg_digits, hemisphere, neg_hemi):
     if not value_str or len(value_str) <= deg_digits:
         return None
-    deg = int(value_str[:deg_digits])
-    minutes = float(value_str[deg_digits:])
+    allowed = {"N", "S"} if deg_digits == 2 else {"E", "W"}
+    if hemisphere not in allowed:
+        return None
+    try:
+        deg = int(value_str[:deg_digits])
+        minutes = float(value_str[deg_digits:])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(minutes) or not (0.0 <= minutes < 60.0):
+        return None
+    max_deg = 90 if deg_digits == 2 else 180
+    if not (0 <= deg <= max_deg):
+        return None
+    if deg == max_deg and minutes != 0:
+        return None
     decimal = deg + minutes / 60.0
     if hemisphere == neg_hemi:
         decimal = -decimal
     return decimal
 
-
 def format_nmea_date(ddmmyy):
+    """ddmmyy를 ISO 날짜로 변환. 80~99는 19xx, 00~79는 20xx로 해석한다."""
     if not ddmmyy or len(ddmmyy) != 6 or not ddmmyy.isdigit():
         return ddmmyy
-    dd, mm, yy = ddmmyy[0:2], ddmmyy[2:4], ddmmyy[4:6]
-    return f"20{yy}-{mm}-{dd}"
-
+    dd, mm, yy = int(ddmmyy[0:2]), int(ddmmyy[2:4]), int(ddmmyy[4:6])
+    year = 1900 + yy if yy >= 80 else 2000 + yy
+    try:
+        import datetime as _dt
+        return _dt.date(year, mm, dd).isoformat()
+    except ValueError:
+        return ddmmyy
 
 def format_nmea_time(hhmmss):
     if not hhmmss or len(hhmmss) < 6:
         return hhmmss
-    hh, mm, ss = hhmmss[0:2], hhmmss[2:4], hhmmss[4:]
-    return f"{hh}:{mm}:{ss}"
-
+    try:
+        hh = int(hhmmss[0:2]); mm = int(hhmmss[2:4]); ss = float(hhmmss[4:])
+    except (TypeError, ValueError, OverflowError):
+        return hhmmss
+    if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss < 60):
+        return hhmmss
+    sec_text = hhmmss[4:]
+    return f"{hh:02d}:{mm:02d}:{sec_text}"
 
 def parse_rmc(fields):
     if len(fields) < 10:
         return None
-    lat_str, lat_hemi = fields[3], fields[4]
-    lon_str, lon_hemi = fields[5], fields[6]
-    if not lat_str or not lon_str:
-        return None
+    lat_str, lat_hemi = fields[3].strip(), fields[4].strip().upper()
+    lon_str, lon_hemi = fields[5].strip(), fields[6].strip().upper()
     lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
     lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
     if lat is None or lon is None:
         return None
-    speed_knots = fields[7] if len(fields) > 7 else ""
-    mode_field = fields[12] if len(fields) > 12 else ""
-    mode = mode_field.split("*")[0] if mode_field else ""
+
+    parse_warnings = []
+    speed_knots = fields[7].strip() if len(fields) > 7 else ""
+    speed_kmh = None
+    if speed_knots:
+        try:
+            speed = float(speed_knots)
+            if math.isfinite(speed) and speed >= 0:
+                speed_kmh = speed * 1.852
+            else:
+                parse_warnings.append("invalid_speed")
+        except (ValueError, OverflowError):
+            parse_warnings.append("invalid_speed")
+
+    status = fields[2].strip().upper() if len(fields) > 2 else ""
+    status_valid = status == "A"
+    if status not in {"A", "V", ""}:
+        parse_warnings.append("invalid_status")
+
+    magvar_dir = fields[11].strip().upper() if len(fields) > 11 else ""
+    if magvar_dir and magvar_dir not in {"E", "W"}:
+        parse_warnings.append("invalid_magvar_dir")
+
+    mode = fields[12].strip().upper() if len(fields) > 12 else ""
     return {
         "lat": lat, "lon": lon,
-        "date": format_nmea_date(fields[9] if len(fields) > 9 else ""),
-        "utc_time": format_nmea_time(fields[1]), "status": fields[2],
-        "speed_knots": speed_knots,
-        "speed_kmh": (float(speed_knots) * 1.852) if speed_knots else None,
-        "track_deg": fields[8] if len(fields) > 8 else "",
-        "magvar": fields[10] if len(fields) > 10 else "",
-        "magvar_dir": fields[11] if len(fields) > 11 else "",
-        "mode": mode,
+        "date": format_nmea_date(fields[9].strip() if len(fields) > 9 else ""),
+        "utc_time": format_nmea_time(fields[1].strip()), "status": status,
+        "status_valid": status_valid,
+        "speed_knots": speed_knots, "speed_kmh": speed_kmh,
+        "track_deg": fields[8].strip() if len(fields) > 8 else "",
+        "magvar": fields[10].strip() if len(fields) > 10 else "",
+        "magvar_dir": magvar_dir, "mode": mode,
+        "parse_warnings": ";".join(parse_warnings),
     }
-
 
 def parse_gga(fields):
     if len(fields) < 10:
         return None
-    lat_str, lat_hemi = fields[2], fields[3]
-    lon_str, lon_hemi = fields[4], fields[5]
-    if not lat_str or not lon_str:
-        return None
+    lat_str, lat_hemi = fields[2].strip(), fields[3].strip().upper()
+    lon_str, lon_hemi = fields[4].strip(), fields[5].strip().upper()
     lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
     lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
     if lat is None or lon is None:
         return None
+    quality = fields[6].strip() if len(fields) > 6 else ""
+    status_valid = quality.isdigit() and int(quality) > 0
     return {
-        "lat": lat, "lon": lon,
-        "date": "",
-        "utc_time": format_nmea_time(fields[1]), "status": fields[6],
+        "lat": lat, "lon": lon, "date": "",
+        "utc_time": format_nmea_time(fields[1].strip()), "status": quality,
+        "status_valid": status_valid,
         "speed_knots": "", "speed_kmh": None, "track_deg": "",
         "magvar": "", "magvar_dir": "", "mode": "",
-        "altitude_m": fields[9] if len(fields) > 9 else "",
+        "altitude_m": fields[9].strip() if len(fields) > 9 else "",
+        "parse_warnings": "" if quality.isdigit() else "invalid_fix_quality",
     }
-
 
 NMEA_PARSERS = {"RMC": parse_rmc, "GGA": parse_gga}
 
 
 def try_parse_nmea(line):
-    body = line[1:] if line.startswith("$") else line
+    if not isinstance(line, str):
+        return None
+    raw = line.strip("\x00\r\n\t ")
+    body_with_checksum = raw[1:] if raw.startswith("$") else raw
+    checksum_ok = nmea_checksum_ok(body_with_checksum)
+    body = body_with_checksum.split("*", 1)[0]
     fields = body.split(",")
     if not fields or len(fields[0]) != 5:
         return None
-    talker, sentence_type = fields[0][:2], fields[0][2:]
+    talker, sentence_type = fields[0][:2], fields[0][2:].upper()
+    if not talker.isalpha():
+        return None
     parser = NMEA_PARSERS.get(sentence_type)
     if parser is None:
         return None
-    parsed = parser(fields)
+    try:
+        parsed = parser(fields)
+    except (ValueError, TypeError, OverflowError, IndexError) as exc:
+        warn(f"NMEA {sentence_type} 파싱 실패: {exc} - 원문은 미분류 텍스트로 보존")
+        return None
     if parsed is None:
         return None
     parsed["talker"] = talker
     parsed["sentence_type"] = sentence_type
-    parsed["raw"] = line
-    parsed["checksum_ok"] = nmea_checksum_ok(body)
+    parsed["raw"] = raw
+    parsed["checksum_ok"] = checksum_ok
+    parsed["trusted"] = bool(parsed.get("status_valid", True) and checksum_ok is not False and not parsed.get("parse_warnings"))
     return parsed
-
 
 def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                      dry_run=False):
@@ -714,7 +779,7 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
         seq_counters[stream.index] += 1
 
         output_file = ""
-        if "OUT_OF_RANGE" not in reasons:
+        if reasons == ["OK"]:
             payload = bytes(mm[payload_offset:payload_offset + e["length"]])
 
             if preview_printed[stream.index] < 3:
@@ -761,6 +826,9 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                         "magvar_dir": parsed.get("magvar_dir", ""),
                         "mode": parsed.get("mode", ""),
                         "checksum_ok": parsed["checksum_ok"],
+                        "status_valid": parsed.get("status_valid", ""),
+                        "trusted": parsed.get("trusted", ""),
+                        "parse_warnings": parsed.get("parse_warnings", ""),
                         "sequence": seq,
                         "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
                         "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
@@ -775,6 +843,7 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                     "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
                     "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
                 }
+                row["vector_length"] = len(value)
                 if len(value) == 3:
                     row["x"], row["y"], row["z"] = (f"{v:.6f}" for v in value)
                 else:
@@ -783,7 +852,8 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                 sensor_rows_by_stream[stream.index].append(row)
         else:
             warn(f"엔트리 #{seq} (stream={stream.index}, {e['chunk_id']!r}) "
-                 f"OUT_OF_RANGE - payload 추출 생략, chunk_offset=0x{chunk_offset:X}")
+                 f"validation={status} - 안전을 위해 payload 추출/자동 디코딩 생략, "
+                 f"chunk_offset=0x{chunk_offset:X}")
 
         index_rows.append({
             "sequence": seq,
@@ -903,7 +973,7 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
                 fieldnames = [
                     "date", "utc_time", "status", "latitude", "longitude",
                     "speed_knots", "speed_kmh", "track_deg", "magvar", "magvar_dir",
-                    "mode", "checksum_ok",
+                    "mode", "checksum_ok", "status_valid", "trusted", "parse_warnings",
                     "sequence", "idx1_entry_offset", "chunk_id", "sentence_type", "raw_sentence",
                 ]
                 w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -921,15 +991,17 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
             if dry_run:
                 continue
 
-            n_values = len(sensor_rows[0]) - 3 if sensor_rows else 0
             sensor_csv = os.path.join(stream_dir, "sensor_values.csv")
+            all_value_fields = []
+            seen_value_fields = set()
+            for row in sensor_rows:
+                for key in row:
+                    if key not in {"sequence", "idx1_entry_offset", "chunk_id", "vector_length"} and key not in seen_value_fields:
+                        seen_value_fields.add(key)
+                        all_value_fields.append(key)
+            fieldnames = ["sequence", "idx1_entry_offset", "chunk_id", "vector_length"] + all_value_fields
             with open(sensor_csv, "w", newline="", encoding="utf-8") as f:
-                if sensor_rows and "x" in sensor_rows[0]:
-                    value_fields = ["x", "y", "z"]
-                else:
-                    value_fields = [f"value_{i}" for i in range(n_values)]
-                fieldnames = ["sequence", "idx1_entry_offset", "chunk_id"] + value_fields
-                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(sensor_rows)
 
@@ -987,6 +1059,7 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    WARNINGS.clear()
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
     assert_riff_file(args.input)

@@ -1,7 +1,7 @@
 # 언제 뭘 쓰는지
 
 - AVI, strl에 스트림 이름/핸들러가 이미 나와있음(GPSR, SENS 이런 식) → **GPS_metadata_avi.py**
-- AVI, strl에 이름 없이 그냥 txt 타입이라고만 나옴, 뭔지 모름 → **GPS_meatadata_GPRMC.py**
+- AVI, strl에 이름 없이 그냥 txt 타입이라고만 나옴, 뭔지 모름 → **GPS_metadata_GPRMC.py**
 - MP4(INAVI 등, moov/trak 구조) → **GPS_metadata_mp4_pvc1_Atext.py**
 
 # AVI_exception_lot_RIFF.py
@@ -51,7 +51,7 @@ GPS_Sample_1/<파일명>/
 
 Sample 1-1, 1-2만 가능
 
-# GPS_meatadata_GPRMC.py 기준
+# GPS_metadata_GPRMC.py 기준
 
 strl에 스트림 이름이 아예 없어서(그냥 txt) 뭔지 모르는 경우 전용. GPS_metadata_avi.py 를
 import해서 저수준 RIFF/idx1 파싱을 그대로 재사용함 (같은 폴더에 있어야 됨).
@@ -62,7 +62,7 @@ import해서 저수준 RIFF/idx1 파싱을 그대로 재사용함 (같은 폴더
 (raw carving은 GPS_metadata_avi.py 로 따로 하라고 안내만 함).
 
 ```
-python GPS_meatadata_GPRMC.py "영상.avi" "출력폴더"
+python GPS_metadata_GPRMC.py "영상.avi" "출력폴더"
 ```
 
 출력폴더도 내가 넘긴 경로 바로 밑에 스트림 라벨 폴더 생김 (자동으로 `<파일명>` 서브폴더
@@ -77,7 +77,8 @@ GPS_Sample_6/
     ├── coordinates.txt      ← GPRMC만 추려서 "1. 위도, 경도" 형식 (39줄)
     ├── coordinates.csv      ← 컬럼 순서: date, utc_time, status, latitude, longitude,
     │                            speed_knots, speed_kmh, track_deg, magvar, magvar_dir,
-    │                            mode, checksum_ok, (뒤는 원본대조용) sequence,
+    │                            mode, checksum_ok, status_valid, trusted, parse_warnings,
+    │                            (뒤는 원본대조용) sequence,
     │                            idx1_entry_offset, chunk_id, sentence_type, raw_sentence
     │                            ※ latitude/longitude는 부호 있는 십진도 (N/E=+, S/W=-)
     │                            → N/S,E/W 글자 따로 안 남김, 이 값 그대로 지도에 찍으면 됨
@@ -90,7 +91,7 @@ GPS_Sample_6/
 
 AVI 두 개랑 완전히 다른 컨테이너(MP4/ISO BMFF, moov→trak→mdia→hdlr→minf→stbl
 구조)라 별도 스크립트. RIFF/idx1 파싱을 재사용하는 위 두 개와 달리 이건
-box size 기반으로 moov/trak을 직접 순회해서 `handler_type == 'text'`인 Track을
+box size 기반으로 moov/trak을 직접 순회해서 `handler_type`이 `text`/`sbtl`/`subt`인 Track을
 찾고, `stsd/stsc/stsz/stco(or co64)`를 조합해서 각 Sample의 절대 offset/size를
 계산하는 방식(문자열 검색 안 씀 — mdat 안 바이너리에 우연히 "moov" 같은 문자열이
 섞여 있을 수 있어서). INAVI Z300 파일 기준으로 검증했지만 이 box 구조 자체는
@@ -115,7 +116,7 @@ GPS_Sample_2/
 ├── track_table.csv               ← 이 MP4에 Track이 몇 개, 각각 handler(vide/soun/text)/
 │                                     이름/stsd 타입/Sample 개수 요약
 ├── warnings.log                  ← box 경계 초과, stsc/stsz 불일치, offset 범위초과 등 경고
-└── TRACK{N}_TEXT/                ← handler_type=='text'인 Track마다 하나 (N=전체 Track
+└── TRACK{N}_TEXT/                ← 지원 text/subtitle handler(text/sbtl/subt) Track마다 하나 (N=전체 Track
     │                                 순번, vide/soun 포함해서 센 번호라 3부터 시작할 수 있음)
     ├── index.csv                 ← Sample 하나하나의 chunk/offset/size/검증결과 로그
     ├── coordinates.csv           ← GPRMC/GPGGA 인식된 것만 자동 생성 (GPS 없는 파일이면 안 생김)
@@ -132,12 +133,12 @@ GPS_Sample_2/
 
 # 공통 주의사항
 
-- GPRMC/GPGGA 파싱은 NMEA 0183 공개 표준 그대로 옮긴 거라 안전함 (추측 아님, 세 스크립트 다 동일 로직)
+- GPRMC/GPGGA 파싱은 NMEA 0183 필드 형식을 기준으로 하되, 손상 레코드 예외처리와 좌표/방향 범위 검증을 추가함. checksum/status는 별도 기록하며 `trusted` 값으로 1차 신뢰 여부를 확인할 수 있음.
 - float32 벡터(SENS/sensor_values.csv, AVI 쪽)와 MP4 쪽 gsensor 필드는 둘 다 공식 스펙이 아니라
   관찰/추정한 것 — 다른 파일에서 같은 패턴이 나와도 곧이곧대로 믿지 말고 값 범위부터 확인할 것
 - MP4 Sample 맨 앞 "2바이트 길이 프리픽스"도 마찬가지로 QuickTime text sample 관례를 보고
   넣은 거고, `길이+2 == Sample 크기`가 실제로 맞는지 매번 검증한 다음에만 씀 — 안 맞는 장비면
   자동으로 raw 텍스트 후보 취급으로 빠짐
-- 세 스크립트 다 raw는 항상 그대로 보존함 (chunks/*.bin, `{prefix}_concat.bin` 또는
-  raw_chunks/*.bin, raw_concat.bin, MP4 쪽은 --extract 옵션) — 디코딩 결과가 의심스러우면
-  여기서 원본 대조
+- 구조/offset/크기가 `OK`로 검증된 레코드는 raw를 그대로 보존함 (chunks/*.bin, `{prefix}_concat.bin` 또는
+  raw_chunks/*.bin, raw_concat.bin, MP4 쪽은 --extract 옵션). AVI에서 `ID_MISMATCH`/`SIZE_MISMATCH`/
+  `OUT_OF_RANGE`인 idx1 entry는 false positive 방지를 위해 자동 추출·디코딩하지 않고 `index.csv`에만 남김.
