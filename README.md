@@ -2,7 +2,8 @@
 
 - AVI, strl에 스트림 이름/핸들러가 이미 나와있음(GPSR, SENS 이런 식) → **GPS_metadata_avi.py**
 - AVI, strl에 이름 없이 그냥 txt 타입이라고만 나옴, 뭔지 모름 → **GPS_metadata_GPRMC.py**
-- MP4(INAVI 등, moov/trak 구조) → **GPS_metadata_mp4_pvc1_Atext.py**
+- MP4(INAVI 등), moov 안에 stsc/stsz/stco 있는 일반 구조 → **GPS_metadata_mp4_pvc1_Atext.py**
+- MP4인데 위 스크립트로 돌리면 "Chunk offset을 하나도 못 구함"만 뜨고 안 나옴 → Fragmented MP4(ftyp major_brand=iso4, moov 대신 moof/mdat이 반복)일 가능성 큼, INAVI QXD8000 등 → **GPS_metadata_fregment_iso4_Atext.py**
 
 # AVI_exception_lot_RIFF.py
 
@@ -130,6 +131,62 @@ GPS_Sample_2/
     │                                 안에 있었다는 것만 표시 (후보 표시일 뿐 해석 아님)
     └── chunks/*.bin               ← --extract 줬을 때만 생김, Sample 원본 그대로 개별 저장
 ```
+
+# GPS_metadata_fregment_iso4_Atext.py 기준
+
+GPS_metadata_mp4_pvc1_Atext.py 랑 Atext 내용물 포맷(`gsensor...;GPRMC...;CAR...` 세미콜론 구분
+텍스트)은 완전히 같은 장비인데, 컨테이너 구조가 다름 — moov 안에 stsc/stsz/stco 같은 일반
+Sample Table이 아예 없고 Fragmented MP4(ftyp major_brand=iso4, `moof`+`mdat`이 파일 끝까지
+반복되는 구조)라서 위 스크립트로 돌리면 `Track #3(text): Chunk offset을 하나도 못 구함` 경고만
+뜨고 아무것도 안 뽑힘. INAVI QXD8000이 이 케이스 (WHS4_Blackbox GPS Sample 3,
+`REC_20240312_082217_F.mp4`).
+
+라이브러리 없이 직접(struct/seek/read) `moof → traf → tfhd/tfdt/trun`을 box size 기반으로
+순회해서 text Track(`moov/trak/mdia/hdlr`의 handler_type==text로 식별, track_ID는 "몇 번째
+trak"이 아니라 tkhd.track_ID 값 그 자체) Sample의 절대 offset/size를 계산하고,
+tfdt(`baseMediaDecodeTime`) + duration으로 영상 재생 시간(초) 구간까지 계산함.
+duration/size는 `trun → tfhd → trex(moov/mvex)` 순으로 fallback.
+
+Atext payload 해석(gsensor/GPRMC 정규식, NMEA 파싱)은 GPS_metadata_mp4_pvc1_Atext.py 로직을
+그대로 재사용. 요청받은 대로 최종 결과는 GSENSOR / GPRMC(+GPGGA도 지원) 두 종류만 남기고,
+같이 실려오는 `CAR,...` 같은 나머지 상태 문자열은 버림 — 파일 안에 그거 말고 다른 포맷이
+더 있는지는 원본 바이트를 스크립트와 별개로 직접 재파싱해서 확인함
+(`REC_20240312_082217_F.mp4` 기준 gsensor(600)/GPRMC(60)/CAR(600) 세 종류가 전부, 다른 세그먼트 없음).
+
+```
+python GPS_metadata_fregment_iso4_Atext.py "영상.mp4" "출력폴더"
+python GPS_metadata_fregment_iso4_Atext.py "영상.mp4" "출력폴더" --list-tracks   # Track 목록만
+python GPS_metadata_fregment_iso4_Atext.py "영상.mp4" "출력폴더" --dry-run      # 파일 미생성, 콘솔 출력만
+python GPS_metadata_fregment_iso4_Atext.py "영상.mp4" "출력폴더" --track-id 3   # text handler Track이 여러 개일 때 지정
+python GPS_metadata_fregment_iso4_Atext.py "영상.mp4" "출력폴더" --max-print 20 # 콘솔 출력 개수 제한(CSV는 항상 전체 기록)
+python GPS_metadata_fregment_iso4_Atext.py "영상.mp4" "출력폴더" --debug       # Box/Tfhd/Tfdt/Trun 값까지 콘솔에 출력(hex editor 대조용)
+```
+
+출력폴더 구조(GPS_Sample_3가 실제 예, `REC_20240312_082217_F.mp4` 기준 — 60초 분량, 600 sample):
+
+```
+GPS_Sample_3/
+├── track_table.csv            ← 이 MP4에 Track이 몇 개, 각각 handler(vide/soun/text)/이름/
+│                                  stsd 타입(hvc1/sowt/text 등)/Sample 개수 요약
+├── warnings.log                ← box 경계 초과, tfhd/trun 불일치, offset 범위초과 등 경고
+├── console_output.txt          ← (실행 결과를 리다이렉트해서 남긴 것) Sample 하나하나의 상세 로그
+└── TRACK{track_ID}_TEXT/       ← text handler Track 1개당 폴더 (N=tkhd.track_ID 값 그대로,
+    │                               "몇 번째 trak인지"가 아님)
+    ├── index.csv                ← Sample마다 moof_index/traf_index/trun_index, absolute_offset,
+    │                                size, dts, duration, start_time_sec, end_time_sec, validation
+    ├── coordinates.csv          ← GPRMC/GPGGA 인식된 것만 (start_time_sec/end_time_sec 포함)
+    ├── coordinates.txt          ← "1. 위도, 경도" 형식
+    ├── sensor_values.csv        ← gsensor 값(x_raw/y_raw/z_raw/scale + x_g/y_g/z_g 환산값,
+    │                                start_time_sec 포함 — count/scale 필드 의미는 실측 데이터로
+    │                                역산한 것, 공식 스펙 아님 ⚠)
+    └── timeline.csv             ← GPS(1Hz)+G센서(10Hz)를 sample 시간 기준 한 줄로 합친 통합
+                                     타임라인(시각화용, 신규). latitude/longitude/speed_kmh 등은
+                                     GPRMC가 실제로 실려온 sample에만 값이 채워지고 나머지는 공란,
+                                     `*_last` 컬럼은 가장 최근 GPS 값을 그대로 이어붙인 것(보간 안 함)
+```
+
+MP4가 Fragmented가 아니거나(moof가 하나도 없음), text handler Track을 못 찾으면 그 자리에서
+바로 경고 찍고 종료함 — GPS_metadata_mp4_pvc1_Atext.py 쪽을 대신 쓰라고 안내 메시지 남김.
 
 # 공통 주의사항
 
