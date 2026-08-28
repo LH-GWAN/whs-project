@@ -158,6 +158,9 @@ def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("input", help="입력 AVI 파일 경로")
     p.add_argument("output", help="출력 디렉터리")
+    # 마찬가지로 --overwrite 추가
+    p.add_argument("--overwrite", action="store_true",
+                   help="출력 디렉터리가 비어 있지 않으면 기존 결과를 삭제하고 새로 생성")
     p.add_argument("--sample-size", type=int, default=8,
                     help="스트림별 텍스트 판정에 쓸 샘플 entry 개수 (기본 8)")
     return p.parse_args(argv)
@@ -251,7 +254,13 @@ def main(argv=None):
 
         labels = carve.make_unique_labels(text_streams)
 
-        os.makedirs(args.output, exist_ok=True)
+        carve.prepare_output_dir(
+            args.output,
+            args.input,
+            dry_run=False,
+            overwrite=args.overwrite
+        )
+
         summary_rows = []
         for s in text_streams:
             entries = entries_by_stream.get(s.index, [])
