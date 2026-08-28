@@ -4,6 +4,7 @@ import math
 import mmap
 import os
 import re
+import shutil #기존 출력 디렉터리 삭제용
 import struct
 import sys
 from dataclasses import dataclass, field
@@ -1029,6 +1030,45 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
 
     return decode_summary
 
+#출력 폴더를 준비하는 함수 추가
+def prepare_output_dir(out_dir, input_path, dry_run=False, overwrite=False):
+    """Stale 결과 혼입을 막기 위해 출력 디렉터리를 안전하게 준비한다."""
+    if dry_run:
+        return
+
+    out_abs = os.path.abspath(out_dir)
+    input_abs = os.path.abspath(input_path)
+
+    protected = {
+        os.path.abspath(os.sep),
+        os.path.abspath(os.path.expanduser("~")),
+        os.path.abspath(os.getcwd()),
+        os.path.abspath(os.path.dirname(input_abs)),
+    }
+
+    if os.path.exists(out_abs) and not os.path.isdir(out_abs):
+        raise SystemExit(
+            f"출력 경로가 디렉터리가 아닙니다: {out_abs}"
+        )
+
+    nonempty = os.path.isdir(out_abs) and any(os.scandir(out_abs))
+
+    if nonempty and not overwrite:
+        raise SystemExit(
+            f"출력 디렉터리가 비어 있지 않습니다: {out_abs}\n"
+            "이전 분석 결과가 섞이는 것을 막기 위해 실행을 중단합니다. "
+            "기존 결과를 지우고 새로 분석하려면 --overwrite 를 지정하세요."
+        )
+
+    if nonempty and overwrite:
+        if out_abs in protected:
+            raise SystemExit(
+                f"안전을 위해 이 경로는 --overwrite 할 수 없습니다: {out_abs}"
+            )
+
+        shutil.rmtree(out_abs)
+
+    os.makedirs(out_abs, exist_ok=True)
 
 def print_stream_table(stream_table):
     info("\n[Stream Table]")
@@ -1049,6 +1089,9 @@ def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("input", help="입력 AVI 파일 경로")
     p.add_argument("output", help="출력 디렉터리")
+    # --overwrite 추가
+    p.add_argument("--overwrite", action="store_true",
+                   help="출력 디렉터리가 비어 있지 않으면 기존 결과를 삭제하고 새로 생성")
     p.add_argument("--list-streams", action="store_true",
                     help="스트림 테이블만 발견/출력하고 종료(추출 안 함)")
     p.add_argument("--dry-run", action="store_true",
@@ -1126,6 +1169,13 @@ def main(argv=None):
             info("\n--list-streams 모드: 추출 없이 종료")
             mm.close()
             return
+        
+        prepare_output_dir(
+            args.output,
+            args.input,
+            dry_run=args.dry_run,
+            overwrite=args.overwrite
+        )
 
         base_offset, base_label, base_scores, base_uncertain = detect_base_offset(
             mm, movi_fourcc_pos, idx1_entries)
