@@ -1,175 +1,254 @@
+"""
+블랙박스 AVI 파일에서 "슬랙"(예전 녹화 파일의 잔재)을 제거해 깨끗한 사본을 만든다.
+
+실제 샘플(VUGERA MB-900SB, REC_20240916_172436_F.avi)을 구조 분석해보니, 이
+계열 카메라는 파일을 고정 크기로 미리 만들어두고 앞부분만 새 녹화로 덮어쓰는
+방식이라, 슬랙은 파일 끝 뒤가 아니라 최상위 RIFF가 선언한 movi 영역 *내부에*
+예전 녹화 파일의 RIFF/hdrl/JUNK(구 파일명 포함)/movi가 통째로 남아있는 형태로
+나타난다.
+
+파일 크기는 카메라/모델마다 다를 수 있으므로 어떤 값도 하드코딩하지 않는다.
+대신 "현재 파일 자신의 최상위 RIFF가 선언한 크기"(reference_size)를 그때그때
+읽어서 기준으로 삼아, movi 내부에서 찾은 임베디드 RIFF가
+
+  (a) reference_size와 정확히 같은 크기를 선언하고 있거나
+      (=같은 카메라/포맷이 쓰는 고정 컨테이너 크기 관례를 그대로 물려받은
+      예전 파일이라는 강한 정황 증거), 또는
+  (b) 선언된 크기가 실제 남은 공간보다 커서 원래 있어야 할 만큼 다 들어있지
+      않을 때 (=일부만 덮어써지고 잘려나간 옛날 파일의 잔재라는 확실한 증거)
+
+둘 중 하나면 "예전 파일 잔재"로 판단한다.
+
+idx1은 현재 녹화분 chunk만 정확히 가리키므로, idx1 엔트리를 뒤에서부터 실제
+chunk 헤더와 대조 검증해서 진짜 마지막으로 유효한 지점을 찾고 그 뒤(예전 파일
+잔재 포함)를 전부 잘라낸다. 문자열(mm.find) 검색은 movi의 구조적으로 확정된
+범위 안으로만 제한해서 쓰고, idx1은 전체 파일을 뒤지지 않고 RIFF 안의 자식
+chunk로 구조적으로 직접 찾는다 - 예전 스크립트처럼 전체 파일에서 "idx1" 문자열을
+찾는 방식은 JUNK나 압축 데이터 안에서 우연히 매치되는 위험이 있어 쓰지 않는다.
+"""
+
 import glob
 import mmap
 import os
 import re
+import struct
 
 VIDEO_CHUNK_RE = re.compile(rb"^[0-9]{2}(?:dc|db)$")
 
 
-def _u32le(buf, off):
-    if off < 0 or off + 4 > len(buf):
+def _u32le(mm, off):
+    if off < 0 or off + 4 > len(mm):
         return None
-    return int.from_bytes(buf[off:off+4], "little")
+    return struct.unpack_from("<I", mm, off)[0]
 
 
-def _find_movi(mm):
-    # 첫 RIFF(AVI )의 top-level chunk만 순회한다.
-    if len(mm) < 12 or mm[0:4] != b"RIFF" or mm[8:12] != b"AVI ":
-        return -1
-    riff_size = _u32le(mm, 4)
-    end = min(len(mm), 8 + riff_size) if riff_size is not None else len(mm)
-    pos = 12
+def _iter_chunks(mm, start, end):
+    """start~end 범위 안에서만, 선언된 크기를 따라가며 chunk를 순회한다."""
+    pos = start
     while pos + 8 <= end:
-        cid = bytes(mm[pos:pos+4])
-        size = _u32le(mm, pos+4)
+        cid = bytes(mm[pos:pos + 4])
+        size = _u32le(mm, pos + 4)
         if size is None:
-            break
-        if cid == b"LIST" and pos + 12 <= len(mm) and mm[pos+8:pos+12] == b"movi":
-            return pos
-        nxt = pos + 8 + size + (size & 1)
-        if nxt <= pos or nxt > len(mm):
-            break
-        pos = nxt
-    # 손상된 RIFF size 때문에 구조 순회가 실패한 경우 제한적 fallback.
-    marker = mm.find(b"movi", 12)
-    while marker >= 8:
-        candidate = marker - 8
-        if bytes(mm[candidate:candidate+4]) == b"LIST":
-            size = _u32le(mm, candidate + 4)
-            if size is not None and size >= 4 and candidate + 8 + size <= len(mm):
-                return candidate
-        marker = mm.find(b"movi", marker + 4)
-    return -1
+            return
+        data_start = pos + 8
+        data_end = data_start + size
+        if data_end > end:
+            return
+        yield cid, pos, data_start, data_end, size
+        pos = data_end + (size & 1)
 
 
-def _iter_valid_idx1_candidates(mm):
-    pos = 0
+def _find_first_riff(mm):
+    filesize = len(mm)
+    if filesize < 12 or bytes(mm[0:4]) != b"RIFF":
+        return None
+    size = _u32le(mm, 4)
+    if size is None or bytes(mm[8:12]) != b"AVI ":
+        return None
+    return {"declared_size": size, "content_start": 12, "content_end": min(8 + size, filesize)}
+
+
+def _find_hdrl_movi_idx1(mm, riff):
+    """RIFF의 직계 자식만 구조적으로 순회해 hdrl/movi/idx1을 찾는다."""
+    hdrl = movi = idx1 = None
+    for cid, pos, data_start, data_end, size in _iter_chunks(mm, riff["content_start"], riff["content_end"]):
+        if cid == b"LIST" and data_start + 4 <= len(mm):
+            list_type = bytes(mm[data_start:data_start + 4])
+            if list_type == b"hdrl" and hdrl is None:
+                hdrl = {"content_start": data_start + 4, "content_end": data_end}
+            elif list_type == b"movi" and movi is None:
+                movi = {"pos": pos, "fourcc_pos": data_start,
+                        "content_start": data_start + 4, "content_end": data_end}
+        elif cid == b"idx1" and idx1 is None:
+            idx1 = {"pos": pos, "data_start": data_start, "size": size}
+    return hdrl, movi, idx1
+
+
+def _find_avih_total_frames_pos(mm, hdrl):
+    for cid, pos, data_start, data_end, size in _iter_chunks(mm, hdrl["content_start"], hdrl["content_end"]):
+        if cid == b"avih" and size >= 56:
+            return data_start + 16
+    return None
+
+
+def _parse_idx1_entries(mm, idx1):
+    n = idx1["size"] // 16
+    entries = []
+    for i in range(n):
+        off = idx1["data_start"] + i * 16
+        if off + 16 > len(mm):
+            break
+        entries.append({
+            "chunk_id": bytes(mm[off:off + 4]),
+            "idx_offset": int.from_bytes(mm[off + 8:off + 12], "little"),
+            "length": int.from_bytes(mm[off + 12:off + 16], "little"),
+        })
+    return entries
+
+
+def _detect_base_offset(mm, movi_fourcc_pos, idx1_entries, sample_n=8):
+    filesize = len(mm)
+    candidates = {"movi FourCC 위치": movi_fourcc_pos,
+                  "movi 데이터 시작(+4)": movi_fourcc_pos + 4,
+                  "절대 offset(base=0)": 0}
+    sample = idx1_entries[:sample_n]
+    best_label, best_base, best_score = "movi FourCC 위치", movi_fourcc_pos, -1
+    for label, base in candidates.items():
+        score = 0
+        for e in sample:
+            off = base + e["idx_offset"]
+            if 0 <= off and off + 4 <= filesize and bytes(mm[off:off + 4]) == e["chunk_id"]:
+                score += 1
+        if score > best_score:
+            best_score, best_base, best_label = score, base, label
+    return best_base, best_label, best_score, len(sample)
+
+
+def _validate_chunk(mm, chunk_offset, entry):
+    filesize = len(mm)
+    if chunk_offset < 0 or chunk_offset + 8 > filesize:
+        return False, None
+    if bytes(mm[chunk_offset:chunk_offset + 4]) != entry["chunk_id"]:
+        return False, None
+    if _u32le(mm, chunk_offset + 4) != entry["length"]:
+        return False, None
+    payload_offset = chunk_offset + 8
+    if payload_offset + entry["length"] > filesize:
+        return False, None
+    return True, payload_offset
+
+
+def find_embedded_riffs(mm, search_start, search_end, reference_size):
+    """movi의 구조적으로 확정된 content 범위 안에서만 b"RIFF" + AVI/AVIX 폼타입
+    조합을 찾는다(전체 파일 스캔이 아니라 이 범위로 엄격히 제한됨). 위 모듈
+    docstring에서 설명한 (a)/(b) 조건 중 하나를 만족해야 "예전 파일 잔재"로
+    인정한다."""
+    results = []
+    pos = search_start
     while True:
-        idx = mm.find(b"idx1", pos)
+        idx = mm.find(b"RIFF", pos, search_end)
         if idx < 0:
             break
-        size = _u32le(mm, idx + 4)
-        if size is not None and size >= 16:
-            # 선언된 size가 16의 배수가 아니거나 파일 끝을 넘는 경우(마지막 엔트리가
-            # 잘린 흔한 손상 형태) 거부하지 않고 사용 가능한 만큼만 잘라서 씀.
-            available = max(len(mm) - (idx + 8), 0)
-            usable = min(size, available)
-            usable -= usable % 16
-            if usable >= 16:
-                yield idx, usable
+        if idx + 12 <= search_end and bytes(mm[idx + 8:idx + 12]) in (b"AVI ", b"AVIX"):
+            declared_size = _u32le(mm, idx + 4)
+            remaining = search_end - (idx + 8)
+            same_as_reference = declared_size == reference_size
+            overruns_remaining = declared_size is not None and declared_size > remaining
+            if same_as_reference or overruns_remaining:
+                results.append({
+                    "pos": idx,
+                    "declared_size": declared_size,
+                    "same_as_reference": same_as_reference,
+                    "overruns_remaining": overruns_remaining,
+                })
         pos = idx + 4
-
-
-
-def _score_idx_base(mm, idx_offset, idx_size, base, sample_n=32):
-    """idx1 후보의 여러 엔트리를 실제 chunk header와 대조해 base 신뢰도를 계산한다."""
-    n = idx_size // 16
-    if n <= 0:
-        return 0, 0
-    if n <= sample_n:
-        indexes = list(range(n))
-    else:
-        indexes = sorted({round(i * (n - 1) / (sample_n - 1)) for i in range(sample_n)})
-    matched = 0
-    for i in indexes:
-        epos = idx_offset + 8 + i * 16
-        cid = bytes(mm[epos:epos+4])
-        off = _u32le(mm, epos + 8)
-        size = _u32le(mm, epos + 12)
-        if off is None or size is None:
-            continue
-        cpos = base + off
-        if not (0 <= cpos <= len(mm) - 8):
-            continue
-        if bytes(mm[cpos:cpos+4]) != cid:
-            continue
-        hsize = _u32le(mm, cpos + 4)
-        if hsize != size or cpos + 8 + size > len(mm):
-            continue
-        matched += 1
-    return matched, len(indexes)
-
-def _find_avih_total_frames_pos(mm, movi_start):
-    # movi 앞의 avih만 대상으로 하고 최소 표준 크기(56 bytes)를 확인한다.
-    pos = mm.find(b"avih", 12, movi_start if movi_start > 0 else len(mm))
-    while pos >= 0:
-        size = _u32le(mm, pos + 4)
-        if size is not None and size >= 56 and pos + 8 + size <= len(mm):
-            return pos + 8 + 16
-        pos = mm.find(b"avih", pos + 4, movi_start if movi_start > 0 else len(mm))
-    return None
+    return results
 
 
 def fix_blackbox_video(file_path, output_path):
     print(f"[*] 처리 시작: {file_path}")
+    if os.path.getsize(file_path) == 0:
+        print(f"[-] {file_path}: 빈 파일입니다.")
+        return False
+
     with open(file_path, "rb") as src:
-        if os.path.getsize(file_path) == 0:
-            print(f"[-] {file_path}: 빈 파일입니다.")
-            return False
         mm = mmap.mmap(src.fileno(), 0, access=mmap.ACCESS_READ)
         try:
-            movi_start = _find_movi(mm)
-            if movi_start < 0:
-                print(f"[-] {file_path}: movi 청크를 찾을 수 없습니다.")
+            riff = _find_first_riff(mm)
+            if riff is None:
+                print(f"[-] {file_path}: RIFF/AVI(RIFF....AVI ) 헤더가 아닙니다.")
                 return False
 
-            candidates = list(_iter_valid_idx1_candidates(mm))
-            if not candidates:
-                print(f"[-] {file_path}: 구조적으로 유효한 idx1을 찾을 수 없습니다.")
+            hdrl, movi, idx1 = _find_hdrl_movi_idx1(mm, riff)
+            if movi is None or idx1 is None:
+                print(f"[-] {file_path}: movi 또는 idx1을 구조적으로 찾을 수 없습니다.")
                 return False
 
-            target_idx_offset = -1
-            target_idx_size = 0
-            actual_movi_end = -1
-            for idx_offset, idx_size in reversed(candidates):
-                num_entries = idx_size // 16
-                first_entry = idx_offset + 8
-                last_entry = first_entry + (num_entries - 1) * 16
-                if last_entry + 16 > len(mm):
-                    continue
-                bases = (0, movi_start + 8, movi_start + 12)
-                scored = [(b, *_score_idx_base(mm, idx_offset, idx_size, b)) for b in bases]
-                base_offset, matched, checked = max(scored, key=lambda x: x[1])
-                required = max(1, (checked * 8 + 9) // 10)  # 약 80% 이상 일치 요구
-                if checked == 0 or matched < required:
-                    continue
-
-                last_id = bytes(mm[last_entry:last_entry+4])
-                last_off = _u32le(mm, last_entry + 8)
-                last_size = _u32le(mm, last_entry + 12)
-                if last_off is None or last_size is None:
-                    continue
-                last_chunk_pos = base_offset + last_off
-                if not (0 <= last_chunk_pos <= len(mm)-8):
-                    continue
-                if bytes(mm[last_chunk_pos:last_chunk_pos+4]) != last_id:
-                    continue
-                header_size = _u32le(mm, last_chunk_pos + 4)
-                if header_size is None or header_size != last_size:
-                    continue
-                end = last_chunk_pos + 8 + last_size + (last_size & 1)
-                if end > len(mm):
-                    continue
-
-                target_idx_offset = idx_offset
-                target_idx_size = idx_size
-                actual_movi_end = end
-                print(f"    [+] 매칭 성공! 실제 영상 데이터 끝 지점 추적 완료: {hex(actual_movi_end)}")
-                break
-
-            if target_idx_offset < 0:
-                print(f"[-] {file_path}: 1번 영상에 매칭되는 올바른 인덱스가 없습니다.")
+            embedded = find_embedded_riffs(mm, movi["content_start"], movi["content_end"],
+                                            riff["declared_size"])
+            if not embedded:
+                print(f"[-] {file_path}: movi 내부에서 예전 파일 잔재(슬랙)를 발견하지 "
+                      f"못했습니다 - 이미 깨끗하거나 이 스크립트가 다루는 손상 패턴이 "
+                      f"아닙니다.")
                 return False
 
-            new_movi_size = actual_movi_end - movi_start - 8
-            output_size = actual_movi_end + 8 + target_idx_size
+            for e in embedded:
+                reasons = []
+                if e["same_as_reference"]:
+                    reasons.append("현재 파일과 동일한 선언 크기")
+                if e["overruns_remaining"]:
+                    reasons.append("선언 크기가 남은 공간보다 큼(잘려나간 잔재)")
+                print(f"    [+] 예전 파일 잔재로 보이는 RIFF 발견: 0x{e['pos']:X} "
+                      f"({', '.join(reasons)})")
+
+            idx1_entries = _parse_idx1_entries(mm, idx1)
+            if not idx1_entries:
+                print(f"[-] {file_path}: idx1에 엔트리가 없습니다.")
+                return False
+
+            base_offset, base_label, matched, checked = _detect_base_offset(
+                mm, movi["fourcc_pos"], idx1_entries)
+            print(f"    [+] base offset 선택: {base_label} -> 0x{base_offset:X} "
+                  f"({matched}/{checked} 샘플 일치)")
+            if checked == 0 or matched == 0:
+                print(f"[-] {file_path}: base offset을 신뢰할 수 없습니다(샘플 매치 0).")
+                return False
+
+            actual_movi_end = None
+            kept_entry_count = len(idx1_entries)
+            for i in range(len(idx1_entries) - 1, -1, -1):
+                e = idx1_entries[i]
+                chunk_offset = base_offset + e["idx_offset"]
+                ok, payload_offset = _validate_chunk(mm, chunk_offset, e)
+                if ok:
+                    end = payload_offset + e["length"]
+                    end += end & 1
+                    actual_movi_end = end
+                    kept_entry_count = i + 1
+                    break
+
+            if actual_movi_end is None:
+                print(f"[-] {file_path}: idx1 안에 검증 통과하는 엔트리가 하나도 없습니다.")
+                return False
+
+            print(f"    [+] 매칭 성공! 실제 영상 데이터 끝 지점 추적 완료: {hex(actual_movi_end)}")
+            if kept_entry_count < len(idx1_entries):
+                print(f"    [!] idx1 꼬리에서 {len(idx1_entries) - kept_entry_count}개 엔트리가 "
+                      f"검증 실패해 버려짐 (원래 {len(idx1_entries)}개 -> {kept_entry_count}개 유지)")
+
+            new_movi_size = actual_movi_end - movi["pos"] - 8
+            new_idx1_size = kept_entry_count * 16
+            idx1_out_pos = actual_movi_end
+            output_size = idx1_out_pos + 8 + new_idx1_size
             new_riff_size = output_size - 8
+            if new_movi_size < 0 or new_riff_size < 0:
+                print(f"[-] {file_path}: 복구 결과 크기 계산이 잘못됐습니다(음수).")
+                return False
             if not (0 <= new_movi_size <= 0xFFFFFFFF and 0 <= new_riff_size <= 0xFFFFFFFF):
                 print(f"[-] {file_path}: 복구 결과가 AVI 1.0 32bit RIFF 크기 범위를 벗어납니다.")
                 return False
 
-            # 전체 파일을 메모리에 복사하지 않고 결과 구간과 idx1을 스트리밍 복사한다.
-            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
             copy_block = 8 * 1024 * 1024
             with open(output_path, "w+b") as out:
                 src.seek(0)
@@ -182,44 +261,37 @@ def fix_blackbox_video(file_path, output_path):
                     out.write(block)
                     remaining -= len(block)
 
-                idx1_out_pos = out.tell()
-                src.seek(target_idx_offset)
-                remaining = 8 + target_idx_size
-                while remaining:
-                    block = src.read(min(copy_block, remaining))
-                    if not block:
-                        print(f"[-] {file_path}: idx1 복사 중 예상보다 일찍 EOF 도달")
-                        return False
-                    out.write(block)
-                    remaining -= len(block)
+                out.write(bytes(mm[idx1["pos"]:idx1["pos"] + 8]))
+                for i in range(kept_entry_count):
+                    off = idx1["data_start"] + i * 16
+                    out.write(bytes(mm[off:off + 16]))
 
-                # idx1 헤더의 size 필드는 원본 선언값을 그대로 복사한 것이므로, 잘린
-                # 후보(usable < 원본 선언 size)였던 경우 실제로 쓴 바이트 수(target_idx_size)로
-                # 다시 덮어써서 헤더/실제 길이 불일치를 방지한다.
-                out.seek(idx1_out_pos + 4)
-                out.write(target_idx_size.to_bytes(4, "little"))
-
-                out.seek(movi_start + 4)
-                out.write(new_movi_size.to_bytes(4, "little"))
                 out.seek(4)
                 out.write(new_riff_size.to_bytes(4, "little"))
+                out.seek(movi["pos"] + 4)
+                out.write(new_movi_size.to_bytes(4, "little"))
+                out.seek(idx1_out_pos + 4)
+                out.write(new_idx1_size.to_bytes(4, "little"))
 
-                avih_frames_pos = _find_avih_total_frames_pos(mm, movi_start)
-                if avih_frames_pos is not None and avih_frames_pos + 4 <= actual_movi_end:
-                    frame_count = 0
-                    first_entry = target_idx_offset + 8
-                    for i in range(target_idx_size // 16):
-                        cid = bytes(mm[first_entry+i*16:first_entry+i*16+4])
-                        if VIDEO_CHUNK_RE.fullmatch(cid):
-                            frame_count += 1
-                    out.seek(avih_frames_pos)
-                    out.write(frame_count.to_bytes(4, "little"))
-                    print(f"    [+] 헤더 프레임 수 복구 완료 ({frame_count} Frames)")
+                if hdrl is not None:
+                    frames_pos = _find_avih_total_frames_pos(mm, hdrl)
+                    if frames_pos is not None and frames_pos + 4 <= actual_movi_end:
+                        frame_count = 0
+                        for i in range(kept_entry_count):
+                            off = idx1["data_start"] + i * 16
+                            cid = bytes(mm[off:off + 4])
+                            if VIDEO_CHUNK_RE.fullmatch(cid):
+                                frame_count += 1
+                        out.seek(frames_pos)
+                        out.write(frame_count.to_bytes(4, "little"))
+                        print(f"    [+] 헤더 프레임 수 복구 완료 ({frame_count} Frames)")
 
-            print(f"    [+] 파일 복구 완료! (결과물 크기: {output_size:,} Bytes)\n")
+            print(f"    [+] 파일 복구 완료! (결과물 크기: {output_size:,} Bytes, "
+                  f"원본 대비 {len(mm) - output_size:,} bytes 절단)\n")
             return True
         finally:
             mm.close()
+
 
 def process_all_samples(input_folder, output_folder):
     os.makedirs(output_folder, exist_ok=True)

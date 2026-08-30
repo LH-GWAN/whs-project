@@ -1,13 +1,95 @@
 # 언제 뭘 쓰는지
 
-- AVI, strl에 스트림 이름/핸들러가 이미 나와있음(GPSR, SENS 이런 식) → **GPS_metadata_avi.py**
-- AVI, strl에 이름 없이 그냥 txt 타입이라고만 나옴, 뭔지 모름 → **GPS_metadata_GPRMC.py**
+- **AVI 파일이면 일단 `integration_avi.py`** — 슬랙 판단/리페어(AVI_exception_lot_RIFF.py)
+  → 스트림 자동 선택/추출/디코딩(GPS_metadata_avi.py + GPS_metadata_GPRMC.py)까지 한 번에
+  처리하는 통합 스크립트. strl에 스트림 이름이 있든 없든, 슬랙이 있든 없든 알아서 판단하고
+  처리하므로 AVI는 기본적으로 이거 하나만 쓰면 된다. 아래 `GPS_metadata_avi.py`/
+  `GPS_metadata_GPRMC.py`/`AVI_exception_lot_RIFF.py` 개별 항목은 각 기능이 내부적으로
+  어떻게 동작하는지 참고용으로 남겨둔 것(단독 실행도 여전히 가능).
 - MP4(INAVI 등), moov 안에 stsc/stsz/stco 있는 일반 구조 → **GPS_metadata_mp4_pvc1_Atext.py**
-- MP4인데 위 스크립트로 돌리면 "Chunk offset을 하나도 못 구함"만 뜨고 안 나옴 → Fragmented MP4(ftyp major_brand=iso4, moov 대신 moof/mdat이 반복)일 가능성 큼, INAVI QXD8000 등 → **GPS_metadata_fregment_iso4_Atext.py**
+- MP4인데 위 스크립트로 돌리면 text/sbtl/subt handler를 가진 Track 자체가 없다고 나옴, GPS가
+  Track이 아니라 moov 밑 udta/mamt 커스텀 박스 안에 `$GNRMC` 텍스트로 통째로 들어있는 경우
+  (Land Rover 대시캠 등) → **GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py**
+- MP4인데 위 두 스크립트로 돌리면 "Chunk offset을 하나도 못 구함"만 뜨고 안 나옴 → Fragmented MP4(ftyp major_brand=iso4, moov 대신 moof/mdat이 반복)일 가능성 큼, INAVI QXD8000 등 → **GPS_metadata_fregment_iso4_Atext.py**
+
+# integration_avi.py — AVI는 이거 하나로
+
+`GPS_metadata_avi.py` + `GPS_metadata_GPRMC.py` + `AVI_exception_lot_RIFF.py`를 합친
+통합 스크립트. 파일마다 자동으로 다음 순서로 처리한다.
+
+1. **슬랙 판단**: movi 내부에 예전 녹화 파일 잔재(임베디드 RIFF)가 있거나 최상위 RIFF가
+   2개 이상이면 idx1 기준으로 실제 유효 구간만 남기고 잘라낸 `<파일명>_wo_slack.avi`를
+   만든다. (자세한 판단 기준은 아래 `AVI_exception_lot_RIFF.py` 항목 참고 — 슬랙 유무가
+   GPS 추출 결과 자체에는 영향을 안 준다는 것까지 검증됨.)
+   - 최상위 RIFF 뒤(파일 끝 이후)에 트레일링 데이터가 있는데 RIFF가 아니면(FineVu
+     CustomGPS 샘플처럼 `JUNK` 태그로 시작하는 완전 바이너리) 자르지 않고 `trailing_
+     unknown_data.bin`으로 원본 그대로 별도 보존만 한다 — 실제 GPS 데이터일 수 있어서
+     함부로 지우지 않음.
+2. **추출**: 리페어된 파일(또는 원본)을 `GPS_metadata_avi.py`와 완전히 동일한 로직으로
+   처리 — 스트림 자동 선택, 청크별 내용 기반 분류(NMEA 텍스트/float 벡터/바이너리),
+   80% 다수결로 스트림 종류 확정 후 `coordinates.*`/`sensor_values.csv` 생성.
+
+```
+python integration_avi.py -o "출력루트" "영상1.avi" "영상2.avi" ...
+```
+
+출력은 `출력루트/<파일명>/` 서브폴더에 파일마다 자동 생성됨(GPS_Sample_avi가 실제 예,
+아래 7개 실측 샘플로 검증):
+
+```
+GPS_Sample_avi/
+├── EVT_20240618_184124_F/            ← VUGERA, strl에 GPSR/SENS 이름 있음, 슬랙 없음
+│   ├── GPSR/chunks/*.bin, coordinates.csv/.txt, ...
+│   ├── SENS/chunks/*.bin, sensor_values.csv, ...
+│   └── stream_table.csv, index.csv, decode_detection.csv, warnings.log
+├── REC_20240916_172436_F/            ← VUGERA, movi 내부에 예전 파일 잔재 있어서 슬랙 리페어 적용됨
+│   ├── REC_20240916_172436_F_wo_slack.avi   ← 슬랙 제거된 재생용 사본(4.1MB 절단)
+│   ├── GPSR/, SENS/, stream_table.csv, ...  ← (리페어 전/후 GPS 추출 결과 동일함을 확인)
+│   └── warnings.log
+├── EVT_2025_10_12_02_01_59_S/        ← INAVI, strl에 이름 없이 txts만, 슬랙 없음
+│   └── TXTS/chunks/*.bin, coordinates.csv/.txt, unparsed_lines.txt, ...
+└── 20241024-11h11m18s_N/             ← FineVu X3000 CustomGPS, movi 안 TEXT 스트림은 빈 더미
+    ├── TEXT/chunks/*.bin (전부 0바이트 패턴, 디코딩 안 됨)
+    └── trailing_unknown_data.bin(+.README.txt)  ← RIFF 끝 뒤 23MB 커스텀 바이너리, 원본 보존만
+```
+
+CLI 옵션은 `GPS_metadata_avi.py`와 동일: `--select-mode`(`auto_non_av`/`by_fcctype`/
+`by_index`/`explicit`), `--fcctype`/`--index`/`--chunk-id`, `--dry-run`.
+
+⚠ FineVu "CustomGPS" 두 샘플(X3000/X700)은 GPS 데이터가 AVI 스트림 안에 없고 RIFF 뒤에
+붙는 벤더 자체 바이너리 포맷 안에 있는 것으로 보임 — NMEA 텍스트가 아니라서 이 스크립트로는
+내용을 해독하지 못했고, 원본 그대로 raw로만 잘라 보존해뒀다(위 `trailing_unknown_data.bin`).
 
 # AVI_exception_lot_RIFF.py
 
-RIFF가 2개 이상 있을 경우, 슬랙 데이터 때문에 한번에 idx1을 찾기 어려운 경우가 있다. 이를 방지하고자 RIFF 가 2개 이상 있는 경우 내부 알고리즘을 통해 슬랙 데이터들을 제거하고 영상을 재추출하는 스크립트다.
+이제 `integration_avi.py`에 같은 기능이 통합돼 있어서 보통은 저걸 쓰면 되고, 이 파일은
+그 슬랙-리페어 부분만 떼서 단독으로 쓰고 싶을 때 쓰는 스크립트다(`integration_avi.py`가
+import하는 건 아니고 같은 로직을 각자 파일 안에 복사해서 갖고 있음 — 하나 고쳐도 다른
+하나는 자동으로 안 바뀜, 실측으로 두 결과물이 해시까지 동일한 것만 확인해뒀다).
+
+처음엔 "RIFF가 2개 이상 있으면(파일 끝에 슬랙이 붙는 형태로) idx1을 찾기 어려워진다"고
+생각했는데, 실제 샘플(VUGERA MB-900SB, `REC_20240916_172436_F.avi`)을 hex로 직접 뜯어보니
+슬랙 위치가 예상과 달랐다 — 이 카메라는 파일을 고정 크기로 미리 만들어두고 앞부분만 새
+녹화로 덮어쓰는 방식이라, 슬랙은 **파일 끝이 아니라 최상위 RIFF가 선언한 movi 영역 내부에**
+예전 녹화 파일의 RIFF/hdrl/JUNK(구 파일명 포함)/movi가 통째로 남아있는 형태로 나타난다.
+
+그래서 "movi 내부"에서 임베디드 RIFF를 찾도록 다시 짰고, 판단 기준도 특정 파일 크기(예:
+80MB)를 가정하지 않고 **"이 파일 자신의 최상위 RIFF가 선언한 크기"를 매번 읽어서 기준으로
+삼도록 일반화**했다 — 임베디드 RIFF의 선언 크기가 (a) 그 기준값과 똑같거나, (b) 실제
+남은 공간보다 커서 다 들어갈 수 없으면 "예전 파일 잔재"로 판단해서 그 이후를 idx1 기준으로
+잘라낸다. 실제로 이 샘플에서 예전 파일 2개(`REC_20240822_232548_R.avi`,
+`REC_20240908_064525_F.avi`)의 흔적을 정확히 찾아냈고, 잘라낸 지점이 hex-editor로 직접
+확인한 값과 정확히 일치함을 검증했다. 리페어 전/후로 GPS 추출 결과(좌표/센서값)는 완전히
+동일하다 — idx1은 애초에 현재 녹화분만 가리키고 있어서 이 슬랙에 영향을 안 받기 때문.
+
+```
+python -c "import AVI_exception_lot_RIFF as fix; fix.fix_blackbox_video('입력.avi', '출력.avi')"
+```
+
+또는 스크립트를 그대로 실행하면 현재 폴더의 `REC_*.avi`를 모두 찾아 `./Recovered_2/`에
+일괄 처리한다(`process_all_samples`). 임베디드 RIFF를 못 찾으면(이미 깨끗한 파일이면)
+아무것도 만들지 않고 스킵만 한다 — 7개 실측 샘플 중 실제로 리페어가 필요했던 건 REC 2개
+(F/R)뿐이었고, 나머지 5개(EVT×2, INAVI, FineVu×2)는 전부 오탐 없이 정상 스킵됨을 확인했다.
 
 # GPS_metadata_avi.py 기준
 
@@ -130,6 +212,50 @@ GPS_Sample_2/
     ├── keyword_hits.csv          ← gps/GPS/NMEA/latitude/speed 등 키워드가 그 Sample 텍스트
     │                                 안에 있었다는 것만 표시 (후보 표시일 뿐 해석 아님)
     └── chunks/*.bin               ← --extract 줬을 때만 생김, Sample 원본 그대로 개별 저장
+```
+
+# GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py 기준
+
+pvc1이랑 정반대 케이스 전용. non-fragmented MP4(moov 있음)인데 `moov`의 모든 trak을 다
+확인해도 text/sbtl/subt handler를 가진 Track이 아예 없는 장비가 있음(Land Rover
+대시캠 등) — 이런 파일은 GPS(`$GNRMC`)가 Sample Table이 아니라 `moov → udta → mamt`
+(커스텀 User Data 박스) 안에 그냥 NMEA 텍스트로 나열돼 있음. 다른 스크립트 import 없이
+혼자 완결된 파일(box 순회 + NMEA 파싱 다 자체 구현).
+
+파일이 이 케이스가 맞는지부터 자동으로 확인함 — moof만 있고 moov가 없으면(fragmented),
+text 계열 Track이 하나라도 있으면(pvc1 케이스), udta/mamt가 없으면 각각 이유를 출력하고
+그 파일은 건너뜀(에러로 안 죽음). 그래서 여러 파일을 한 번에 넘겨도 케이스 아닌 파일만
+자동으로 스킵되고 나머지는 정상 처리됨.
+
+```
+python GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py "출력폴더" "영상1.mp4" "영상2.mp4" ...
+```
+
+⚠ 다른 스크립트랑 인자 순서가 다름 — **출력폴더가 먼저, 입력 파일(들)이 뒤**이고 입력을
+여러 개 한 번에 받음(파일마다 자동으로 서브폴더 생성).
+
+출력폴더 구조(GPS_Sample_4가 실제 예 — Land Rover 대시캠 3개 파일, 각 60초/GNRMC 60개):
+
+```
+GPS_Sample_4/
+├── 20250901_204119D/
+│   └── GPS_GNRMC/
+│       ├── coordinates.csv     ← GPS_metadata_GPRMC.py와 컬럼 동일(date, utc_time, status,
+│       │                          latitude, longitude, speed_knots, speed_kmh, track_deg,
+│       │                          magvar, magvar_dir, mode, checksum_ok, status_valid,
+│       │                          trusted, parse_warnings, sequence, idx1_entry_offset,
+│       │                          chunk_id, sentence_type, raw_sentence) — 단, AVI 전용
+│       │                          개념이라 대응 안 되는 두 컬럼만 의미를 바꿈:
+│       │                          idx1_entry_offset → 문장이 시작하는 파일 내 절대 byte offset,
+│       │                          chunk_id → 항상 고정값 "mamt"
+│       ├── coordinates.txt     ← "1. 위도, 경도" 형식
+│       ├── unparsed_lines.txt  ← status=V(그 순간 GPS fix 없음, 정상 상황)나 필드 파싱
+│       │                          실패한 문장 원문
+│       ├── raw_chunks/*.bin    ← 문장 1개당 1개 원본
+│       ├── raw_concat.bin      ← 찾은 순서대로 이어붙인 원본
+│       └── warnings.log
+├── 20250901_215628D/GPS_GNRMC/   ← 위와 동일 구조
+└── 20250901_215728D/GPS_GNRMC/   ← 위와 동일 구조 (구간 중 24초 GPS 끊김 → unparsed_lines.txt로)
 ```
 
 # GPS_metadata_fregment_iso4_Atext.py 기준
