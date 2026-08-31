@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+/build/
+/dist/
+# PyInstaller가 자동 생성하는 spec만 제외 - gpstracer.spec은 직접 작성한 빌드
+# 정의 파일이라 반드시 저장소에 포함되어야 한다.
+*.spec
+!gpstracer.spec
+.venv/
+
+# 배경지도 타일 (수백 MB - 저장소에 넣지 않고 assets/README.md 절차로 각자 생성)
+assets/*.pmtiles
