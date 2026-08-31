@@ -1,7 +1,0 @@
-# GPS Tracer 의존성
-#
-# 분석 엔진(engine/vendor/)과 백엔드 로직(core/, storage/)은 표준 라이브러리만
-# 사용한다 - 아래는 GUI/패키징에만 필요하다.
-
-PySide6>=6.7          # GUI(QtWidgets) + QtWebEngine(리포트 PDF) + QtMultimedia(영상 재생)
-pyinstaller>=6.10     # exe 패키징 (빌드 시에만 필요)
