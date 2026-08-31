@@ -104,8 +104,8 @@ def process_stream(mm, out_dir, stream, entries, base_offset, label):
                     "date": parsed.get("date", ""),
                     "utc_time": parsed.get("utc_time", ""),
                     "status": parsed.get("status", ""),
-                    "latitude": f"{parsed['lat']:.6f}",
-                    "longitude": f"{parsed['lon']:.6f}",
+                    "latitude": f"{parsed['lat']:.6f}" if parsed.get("lat") is not None else "",
+                    "longitude": f"{parsed['lon']:.6f}" if parsed.get("lon") is not None else "",
                     "speed_knots": parsed.get("speed_knots", ""),
                     "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
                     "track_deg": parsed.get("track_deg", ""),
@@ -127,7 +127,9 @@ def process_stream(mm, out_dir, stream, entries, base_offset, label):
 
     coordinates_txt = os.path.join(stream_dir, "coordinates.txt")
     with open(coordinates_txt, "w", encoding="utf-8") as f:
-        for i, row in enumerate(coord_rows, start=1):
+        # coordinates.txt는 "좌표 목록"이라 fix가 없어 좌표가 빈 행은 제외한다
+        # (그 행도 coordinates.csv에는 status=V로 그대로 남는다).
+        for i, row in enumerate([r for r in coord_rows if r["latitude"]], start=1):
             f.write(f"{i}. {row['latitude']}, {row['longitude']}\n")
 
     coordinates_csv = os.path.join(stream_dir, "coordinates.csv")

@@ -363,6 +363,98 @@ class TrackInfo:
     stsd_entries: list = field(default_factory=list)
     samples: list = field(default_factory=list)
     is_text_track: bool = False
+    timescale: int = None
+    sample_times: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 재생 시간축 (stts)
+#
+# 영상 재생에 맞춰 GPS/센서를 시각화하려면 "이 레코드가 영상 몇 초 지점인가"가
+# 있어야 한다. non-fragmented MP4는 그 정보가 stbl/stts(Decoding Time to Sample)에
+# 이미 들어 있다. sample마다 delta(ticks)가 있고 mdhd.timescale로 나누면 초가 된다.
+#
+# 실측(INAVI Z300): mdhd.timescale=1000, stts=[(200, 100)]
+#   -> sample 200개 x 100/1000초 = 0.100초 간격, 총 20.000초
+#
+# 외부 도구(ffprobe 등)로 총 길이만 받아 "1초씩 증가"로 채우는 방식은 쓰지 않는다.
+# GPS는 1Hz라도 gsensor는 10Hz(INAVI)/30Hz(신규 Ambarella)라 균일 가정이 깨지고,
+# 실제로 Mercedes 샘플은 GPS 시각이 18건 중복돼 순번=경과초가 최대 1초 어긋난다.
+# ---------------------------------------------------------------------------
+def parse_mdhd_timescale(f, mdia_children):
+    """mdia/mdhd에서 timescale(초당 tick 수)을 읽는다."""
+    mdhd_box = find_box(mdia_children, b"mdhd")
+    if mdhd_box is None:
+        return None
+    f.seek(mdhd_box.payload_start)
+    payload = f.read(mdhd_box.size - mdhd_box.header_size)
+    if len(payload) < 1:
+        return None
+    version = payload[0]
+    if version == 0 and len(payload) >= 16:
+        timescale = struct.unpack(">I", payload[12:16])[0]
+    elif version == 1 and len(payload) >= 24:
+        timescale = struct.unpack(">I", payload[20:24])[0]
+    else:
+        warn(f"mdhd @ 0x{mdhd_box.start:X}: version={version} 또는 길이가 예상과 다름")
+        return None
+    if timescale == 0:
+        warn(f"mdhd @ 0x{mdhd_box.start:X}: timescale==0 - 시간축 계산 불가")
+        return None
+    return timescale
+
+
+def parse_stts(f, stts_box):
+    """stts를 (sample_count, sample_delta) 목록으로 읽는다."""
+    payload_len = stts_box.size - stts_box.header_size
+    if payload_len < 8:
+        warn(f"stts @ 0x{stts_box.start:X}: payload가 8바이트보다 짧음")
+        return []
+    f.seek(stts_box.payload_start)
+    header = f.read(8)
+    declared = struct.unpack(">I", header[4:8])[0]
+    max_by_box = max(0, (stts_box.end - (stts_box.payload_start + 8)) // 8)
+    entry_count = min(declared, max_by_box, MAX_TABLE_ENTRIES)
+    if declared != entry_count:
+        warn(f"stts @ 0x{stts_box.start:X}: entry_count={declared}를 box 경계/안전 "
+             f"한도에 따라 {entry_count}로 제한")
+    payload = f.read(entry_count * 8)
+    entries = []
+    for i in range(entry_count):
+        chunk = payload[i * 8:(i + 1) * 8]
+        if len(chunk) < 8:
+            warn(f"stts @ 0x{stts_box.start:X}: entry #{i+1} 데이터 부족")
+            break
+        count, delta = struct.unpack(">II", chunk)
+        if count == 0:
+            continue
+        entries.append((count, delta))
+    return entries
+
+
+def build_sample_times(stts_entries, timescale, sample_count):
+    """stts를 펼쳐서 sample별 (start_sec, end_sec)를 만든다.
+    stts가 sample_count를 못 채우면 마지막 delta로 이어 붙이고 경고를 남긴다."""
+    if not stts_entries or not timescale:
+        return []
+    times = []
+    ticks = 0
+    for count, delta in stts_entries:
+        for _ in range(count):
+            if len(times) >= sample_count:
+                break
+            times.append((ticks / timescale, (ticks + delta) / timescale))
+            ticks += delta
+        if len(times) >= sample_count:
+            break
+    if len(times) < sample_count:
+        last_delta = stts_entries[-1][1]
+        warn(f"stts가 다루는 sample 수({len(times)})가 실제 sample 수({sample_count})보다 "
+             f"적음 - 나머지는 마지막 delta({last_delta})로 이어붙여 추정함")
+        while len(times) < sample_count:
+            times.append((ticks / timescale, (ticks + last_delta) / timescale))
+            ticks += last_delta
+    return times
 
 
 def parse_track(f, trak_box, track_number):
@@ -427,6 +519,16 @@ def parse_track(f, trak_box, track_number):
                  f"stsd entry 범위({sorted(valid_sdi)})를 벗어남")
 
     ti.samples = compute_sample_positions(stsc_entries, chunk_offsets, sample_sizes)
+
+    # 재생 시간축: mdhd.timescale + stts 로 sample별 시작/종료 시각(초)을 만든다.
+    ti.timescale = parse_mdhd_timescale(f, mdia_children)
+    stts_box = find_box(stbl_children, b"stts")
+    if stts_box is None:
+        warn(f"Track #{track_number}(text): stts가 없어 재생 시간축을 만들 수 없음 "
+             f"- start_time_sec 계열은 공란으로 둠")
+    elif ti.timescale:
+        ti.sample_times = build_sample_times(parse_stts(f, stts_box), ti.timescale,
+                                              len(ti.samples))
     return ti
 
 
@@ -515,10 +617,18 @@ def format_nmea_time(hhmmss):
 def parse_rmc(fields):
     if len(fields) < 10:
         return None
-    lat = _dm_to_decimal(fields[3].strip(), 2, fields[4].strip().upper(), "S")
-    lon = _dm_to_decimal(fields[5].strip(), 3, fields[6].strip().upper(), "W")
+    lat_str, lat_hemi = fields[3].strip(), fields[4].strip().upper()
+    lon_str, lon_hemi = fields[5].strip(), fields[6].strip().upper()
+    lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
+    lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
     if lat is None or lon is None:
-        return None
+        # 위경도 필드가 "비어 있고" status가 A가 아니면 = 그 순간 GPS fix가 없었던
+        # 정상 기록(status=V, mode=N)이므로 좌표만 공란으로 두고 행은 살린다.
+        # 필드에 값은 있는데 파싱이 안 되는 경우는 손상으로 보고 기존대로 버린다.
+        _status = fields[2].strip().upper() if len(fields) > 2 else ""
+        if lat_str or lon_str or _status == "A":
+            return None
+        lat = lon = None
     warnings = []
     speed_knots = fields[7].strip() if len(fields) > 7 else ""
     speed_kmh = None
@@ -633,6 +743,65 @@ def sanitize_label(text):
     return text or "track"
 
 
+def _fmt_sec(value):
+    return f"{value:.3f}" if value is not None else ""
+
+
+def sample_time_range(track_info, sample_number):
+    """sample 번호(1-based)에 대응하는 (start_sec, end_sec). 없으면 (None, None)."""
+    times = track_info.sample_times
+    idx = sample_number - 1
+    if 0 <= idx < len(times):
+        return times[idx]
+    return (None, None)
+
+
+def write_timeline(track_dir, timeline_rows, sensor_rows):
+    """GPS와 G센서를 sample 시간 기준으로 한 줄씩 합친 통합 타임라인.
+    루트 A(fragmented)의 timeline.csv와 같은 목적/컬럼 구성이다.
+    latitude/speed_kmh 등은 그 sample에 GPS가 실제로 실려온 경우에만 채우고,
+    `*_last` 컬럼에만 가장 최근 GPS 값을 이어붙인다(보간하지 않음)."""
+    if not timeline_rows:
+        return
+    cal = {}
+    for r in sensor_rows:
+        cal[r["sample"]] = r
+    last = {}
+    out = []
+    for row in timeline_rows:
+        gps = row.get("_gps")
+        if gps is not None and gps.get("lat") is not None:
+            last = {
+                "latitude_last": f"{gps['lat']:.6f}",
+                "longitude_last": f"{gps['lon']:.6f}",
+                "speed_kmh_last": (f"{gps['speed_kmh']:.3f}"
+                                   if gps.get("speed_kmh") is not None else ""),
+            }
+        sen = cal.get(row["sample"], {})
+        out.append({
+            "sample": row["sample"],
+            "start_time_sec": row["start_time_sec"],
+            "end_time_sec": row["end_time_sec"],
+            "time_source": row["time_source"],
+            "latitude": (f"{gps['lat']:.6f}"
+                         if gps and gps.get("lat") is not None else ""),
+            "longitude": (f"{gps['lon']:.6f}"
+                          if gps and gps.get("lon") is not None else ""),
+            "speed_kmh": (f"{gps['speed_kmh']:.3f}"
+                          if gps and gps.get("speed_kmh") is not None else ""),
+            "track_deg": gps.get("track_deg", "") if gps else "",
+            "gps_date": gps.get("date", "") if gps else "",
+            "gps_utc_time": gps.get("utc_time", "") if gps else "",
+            "gps_checksum_ok": gps.get("checksum_ok", "") if gps else "",
+            "latitude_last": last.get("latitude_last", ""),
+            "longitude_last": last.get("longitude_last", ""),
+            "speed_kmh_last": last.get("speed_kmh_last", ""),
+            "x_g": sen.get("x_g", ""), "y_g": sen.get("y_g", ""), "z_g": sen.get("z_g", ""),
+            "x_g_cal": sen.get("x_g_cal", ""), "y_g_cal": sen.get("y_g_cal", ""),
+            "z_g_cal": sen.get("z_g_cal", ""),
+        })
+    _write_csv(os.path.join(track_dir, "timeline.csv"), out)
+
 def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_extract=False):
     t = track_info
     dir_label = f"TRACK{t.track_number}_TEXT"
@@ -648,6 +817,7 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
     sensor_rows = []
     generic_rows = []
     keyword_hits_rows = []
+    timeline_rows = []
 
     classify_counts = {"gsensor": 0, "gps_nmea": 0, "generic": 0, "length_prefix_mismatch": 0,
                         "undecodable": 0}
@@ -658,11 +828,16 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
         size = s.size
         out_of_range = (offset < 0) or (offset + size > filesize)
 
+        start_sec, end_sec = sample_time_range(t, s.sample_number)
+        time_source = "stts" if start_sec is not None else ""
         index_row = {
             "track": t.track_number,
             "sample": s.sample_number,
             "chunk": s.chunk_number,
             "sample_description_index": s.sample_description_index,
+            "start_time_sec": _fmt_sec(start_sec),
+            "end_time_sec": _fmt_sec(end_sec),
+            "time_source": time_source,
             "absolute_offset": f"0x{offset:08X}",
             "size": size,
             "validation": "OK",
@@ -717,33 +892,64 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
                 "context": text[:120],
             })
 
+        timeline_gps = None
         for segment in split_segments(text):
             kind, payload = classify_segment(segment)
             classify_counts[kind] = classify_counts.get(kind, 0) + 1
 
             if kind == "gsensor":
+                # 원본 필드(field_0, field_1, ...)는 그대로 두고, 관측으로 역산한
+                # 의미(count/scale/x/y/z)와 g 환산값을 앞에 같이 붙인다(⚠ 비공식).
+                # 이렇게 해야 아래 apply_gsensor_calibration이 x_raw를 읽어
+                # x_g_cal 계열을 채울 수 있고, integration_mp4.py 산출물과도 맞는다.
+                fields = payload["fields"]
                 row = {
                     "sample": s.sample_number,
+                    "start_time_sec": _fmt_sec(start_sec),
+                    "end_time_sec": _fmt_sec(end_sec),
+                    "time_source": time_source,
                     "absolute_offset": f"0x{offset:08X}",
                     "subtype": payload["subtype"],
                 }
-                for i, v in enumerate(payload["fields"]):
+                interpreted = {}
+                if len(fields) >= 5:
+                    try:
+                        count, scale = int(fields[0]), int(fields[1])
+                        x_raw, y_raw, z_raw = (int(fields[2]), int(fields[3]), int(fields[4]))
+                        interpreted = {
+                            "count": count, "scale": scale,
+                            "x_raw": x_raw, "y_raw": y_raw, "z_raw": z_raw,
+                            "x_g": (x_raw / scale) if scale else None,
+                            "y_g": (y_raw / scale) if scale else None,
+                            "z_g": (z_raw / scale) if scale else None,
+                        }
+                    except (ValueError, ZeroDivisionError):
+                        interpreted = {}
+                row.update(interpreted)
+                for i, v in enumerate(fields):
                     row[f"field_{i}"] = v
                 sensor_rows.append(row)
 
             elif kind == "gps_nmea":
                 parsed = payload
                 speed_kmh = parsed.get("speed_kmh")
+                timeline_gps = parsed
                 coord_rows.append({
                     "sample": s.sample_number,
+                    "start_time_sec": _fmt_sec(start_sec),
+                    "end_time_sec": _fmt_sec(end_sec),
+                    "time_source": time_source,
                     "date": parsed.get("date", ""),
                     "utc_time": parsed.get("utc_time", ""),
                     "status": parsed.get("status", ""),
-                    "latitude": f"{parsed['lat']:.6f}",
-                    "longitude": f"{parsed['lon']:.6f}",
+                    "latitude": f"{parsed['lat']:.6f}" if parsed.get("lat") is not None else "",
+                    "longitude": f"{parsed['lon']:.6f}" if parsed.get("lon") is not None else "",
                     "speed_knots": parsed.get("speed_knots", ""),
                     "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
                     "track_deg": parsed.get("track_deg", ""),
+                    "magvar": parsed.get("magvar", ""),
+                    "magvar_dir": parsed.get("magvar_dir", ""),
+                    "mode": parsed.get("mode", ""),
                     "sentence_type": parsed["sentence_type"],
                     "checksum_ok": parsed["checksum_ok"],
                     "status_valid": parsed.get("status_valid", ""),
@@ -759,12 +965,23 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
                 row["raw"] = payload["raw"]
                 generic_rows.append(row)
 
+        timeline_rows.append({
+            "sample": s.sample_number,
+            "start_time_sec": _fmt_sec(start_sec),
+            "end_time_sec": _fmt_sec(end_sec),
+            "time_source": time_source,
+            "_gps": timeline_gps,
+        })
+
     if not dry_run:
         _write_csv(os.path.join(track_dir, "index.csv"), index_rows)
         if coord_rows:
             _write_coord_outputs(track_dir, coord_rows)
         if sensor_rows:
+            apply_gsensor_calibration(sensor_rows)
             _write_csv(os.path.join(track_dir, "sensor_values.csv"), sensor_rows)
+        # timeline.csv는 센서 보정 뒤에 만들어야 x_g_cal 계열이 채워진 상태로 들어간다.
+        write_timeline(track_dir, timeline_rows, sensor_rows)
         if generic_rows:
             _write_csv(os.path.join(track_dir, "other_segments_unparsed.csv"), generic_rows)
         if keyword_hits_rows:
@@ -777,6 +994,67 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
         "generic_count": len(generic_rows),
     }
 
+
+# gsensor 자가 보정: "1g에 해당하는 카운트"를 데이터 자체에서 추정한다.
+#
+# 레코드의 <scale> 필드를 "1g당 카운트"로 보는 기존 x_g/y_g/z_g는 기기마다 결과가
+# 제각각이라 절대값을 믿을 수 없다는 게 실측으로 확인됐다(자세한 근거는 architect.md
+# "알려진 한계" 참고).
+#
+#     기기                    scale   |v|/scale
+#     INAVI Z300               512     0.266g
+#     INAVI QXD8000           2048     0.248g
+#     Ambarella(avc1/fMP4)     512     1.99g     <- count를 곱하는 보정도 여기서 반증됨
+#
+# 대신 물리를 쓴다. 차에 고정된 센서는 중력 1g를 항상 받고, 주행 가감속은 급브레이크도
+# 0.3g 수준에 방향이 계속 바뀐다. 그래서 |(x,y,z)| 크기의 중앙값을 1g로 보면 기기
+# 스펙을 몰라도 감도를 역산할 수 있다. 실제로 같은 기기의 다른 파일 3개에서 1023 /
+# 1015 / 1019 로 거의 같은 값이 나와, 노이즈가 아니라 하드웨어 상수를 짚는다는 게
+# 확인됐다.
+#
+# 기존 x_g/y_g/z_g는 건드리지 않고 x_g_cal/y_g_cal/z_g_cal 과 기준값
+# calibration_counts_per_g 를 추가만 한다.
+#
+# 한계: 크기만 보정하고 장착 각도는 보정하지 않는다(중력이 여러 축에 갈린 채로 남는다).
+# 영상 전체가 급가속 구간이면 중앙값 기준이 밀릴 수 있다. 축별 영점 오프셋도 안 본다.
+MIN_CALIBRATION_SAMPLES = 30
+
+
+def apply_gsensor_calibration(sensor_rows):
+    """sensor_rows에 x_g_cal/y_g_cal/z_g_cal/calibration_counts_per_g를 채운다.
+    반환값은 추정한 '1g당 카운트'(표본이 부족하면 None)."""
+    mags = []
+    for r in sensor_rows:
+        try:
+            mags.append(math.sqrt(int(r["x_raw"]) ** 2 + int(r["y_raw"]) ** 2
+                                   + int(r["z_raw"]) ** 2))
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    counts_per_g = None
+    if len(mags) >= MIN_CALIBRATION_SAMPLES:
+        mags.sort()
+        n = len(mags)
+        median = mags[n // 2] if n % 2 else (mags[n // 2 - 1] + mags[n // 2]) / 2.0
+        if median > 0:
+            counts_per_g = median
+
+    for r in sensor_rows:
+        r["calibration_counts_per_g"] = f"{counts_per_g:.1f}" if counts_per_g else ""
+        for axis in ("x", "y", "z"):
+            value = None
+            if counts_per_g:
+                try:
+                    value = int(r[f"{axis}_raw"]) / counts_per_g
+                except (TypeError, ValueError, KeyError):
+                    value = None
+            r[f"{axis}_g_cal"] = value
+
+    if counts_per_g is None and sensor_rows:
+        warn(f"gsensor 자가 보정 생략 - 해석 가능한 레코드가 {len(mags)}개로 "
+             f"{MIN_CALIBRATION_SAMPLES}개 미만이라 중앙값 기준을 신뢰할 수 없음 "
+             f"(x_g_cal 계열은 공란으로 둠)")
+    return counts_per_g
 
 def _write_csv(path, rows):
     if not rows:
@@ -797,7 +1075,9 @@ def _write_csv(path, rows):
 def _write_coord_outputs(track_dir, coord_rows):
     _write_csv(os.path.join(track_dir, "coordinates.csv"), coord_rows)
     with open(os.path.join(track_dir, "coordinates.txt"), "w", encoding="utf-8") as f:
-        for i, row in enumerate(coord_rows, start=1):
+        # coordinates.txt는 "좌표 목록"이라 fix가 없어 좌표가 빈 행은 제외한다
+        # (그 행도 coordinates.csv에는 status=V로 그대로 남는다).
+        for i, row in enumerate([r for r in coord_rows if r["latitude"]], start=1):
             f.write(f"{i}. {row['latitude']}, {row['longitude']}\n")
 
 

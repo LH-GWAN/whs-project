@@ -1,34 +1,3 @@
-"""
-GPS_metadata_mp4_udta_mamt_GNRMC.py
-
-non-fragmented MP4 파일 중 "GPS text track이 없고, moov/udta/mamt 안에
-$GNRMC NMEA 문장이 저장되어 있는" 예외적인 블랙박스 포맷 전용 GPS 추출 스크립트.
-
-이 스크립트는 다음과 같은 조건을 만족하는 MP4 파일에 적용된다 (자동으로 판별함).
-    1. non-fragmented MP4 (moof 박스가 아니라 moov 박스를 사용)
-    2. moov 안의 모든 trak을 확인했을 때 handler_type == "text" 인 트랙이 없음
-    3. moov -> udta -> mamt 커스텀 박스 안에 "$GNRMC,...*XX\\r\\n" 형태의
-       NMEA RMC 문장이 가변 길이로 여러 개 연속 저장되어 있음
-
-위 조건 중 하나라도 맞지 않으면(예: text track이 존재, udta/mamt가 없음, moof
-기반 fragmented mp4 등) 해당 파일은 건너뛰고 이유를 알려준다 - 즉 이 파일은
-다른 스크립트(GPS_metadata_mp4_pvc1_Atext.py, GPS_metadata_fregment_iso4_Atext.py
-등)로 처리해야 하는 케이스라는 뜻이다.
-
-CSV 출력 형식은 GPS_metadata_GPRMC.py(AVI용)가 만드는 coordinates.csv와
-동일한 컬럼 구성을 따른다. 다만 AVI 고유 개념인 idx1_entry_offset/chunk_id는
-MP4에 그대로 존재하지 않으므로 다음과 같이 의미를 대체했다.
-    - idx1_entry_offset -> 파일 내에서 해당 NMEA 문장이 시작하는 절대 byte offset
-    - chunk_id           -> 항상 "mamt" 고정값 (모든 GPS 문장이 mamt 박스 하나에서 나오므로)
-
-사용법:
-    python GPS_metadata_mp4_udta_mamt_GNRMC.py <output_dir> <input1.mp4> [input2.mp4 ...]
-
-입력 파일마다 <output_dir>/<파일명(확장자 제외)>/GPS_GNRMC/ 아래에
-coordinates.csv, coordinates.txt, unparsed_lines.txt, raw_concat.bin,
-raw_chunks/*.bin, warnings.log 를 생성한다.
-"""
-
 import argparse
 import csv
 import math
@@ -58,15 +27,6 @@ def info(msg):
     print(msg)
 
 
-# ---------------------------------------------------------------------------
-# 1. MP4 Box 구조 순회 (top-level 공통으로 재사용)
-#
-# MP4의 모든 Box는 [4-byte size][4-byte type][payload] 형태이고 size는
-# Big Endian이며 "해당 Box 시작 위치부터 계산한 전체 크기"이다. 따라서
-# 다음 Box의 시작 위치는 "현재 Box 시작 offset + size" 로 계산할 수 있고,
-# 이 규칙만 있으면 특정 Box가 어떤 Box 바로 뒤에 오는지 몰라도 순서대로
-# 모든 형제(sibling) Box를 훑을 수 있다.
-# ---------------------------------------------------------------------------
 class Box:
     __slots__ = ("box_type", "start", "size", "header_size")
 
@@ -86,14 +46,6 @@ class Box:
 
 
 def iter_boxes(f, start, end, context=""):
-    """[start, end) 구간 안에서 형제 Box들을 순서대로 yield한다.
-
-    - size가 1이면 뒤이어 오는 8바이트가 64bit 실제 크기(extended size)이다.
-    - size가 0이면 "이 Box가 부모 영역 끝까지 이어진다"는 뜻이다.
-    - size가 이상하면(0보다 작거나, 부모 경계를 넘어가면) 더 이상 이 구간을
-      신뢰할 수 없으므로 경고를 남기고 순회를 중단한다. 이렇게 하면 손상된
-      size 값 때문에 무한 루프에 빠지거나 엉뚱한 위치를 계속 읽는 것을 막는다.
-    """
     pos = start
     while pos + 8 <= end:
         f.seek(pos)
@@ -142,14 +94,6 @@ def find_all(boxes, box_type):
     return [b for b in boxes if b.box_type == box_type]
 
 
-# ---------------------------------------------------------------------------
-# 2. trak -> mdia -> hdlr 탐색
-#
-# 각 trak이 어떤 종류의 트랙인지는 trak/mdia/hdlr Box 안의 handler_type
-# 필드(4바이트)로 알 수 있다. hdlr payload 레이아웃은 다음과 같다.
-#   version(1) + flags(3) + pre_defined(4) + handler_type(4) + ...
-# 즉 payload 시작에서 8바이트를 건너뛰면 handler_type 4바이트가 나온다.
-# ---------------------------------------------------------------------------
 def get_handler_type(f, trak_box):
     trak_children = list(iter_boxes(f, trak_box.payload_start, trak_box.end,
                                      context=f"trak@0x{trak_box.start:X}"))
@@ -169,11 +113,7 @@ def get_handler_type(f, trak_box):
     return payload[8:12]
 
 
-# ---------------------------------------------------------------------------
-# 3. NMEA GNRMC/GPRMC 파싱 (talker ID만 다르고 필드 구조는 동일하므로 공통 처리)
-# ---------------------------------------------------------------------------
 def nmea_checksum_ok(sentence):
-    """'$' 로 시작하고 '*XX'로 끝나는 NMEA 문장의 checksum(XOR)을 검증한다."""
     sentence = sentence.strip().lstrip("$")
     if "*" not in sentence:
         return None
@@ -188,11 +128,6 @@ def nmea_checksum_ok(sentence):
 
 
 def _dm_to_decimal(value_str, deg_digits, hemisphere, neg_hemi):
-    """NMEA의 ddmm.mmmmm / dddmm.mmmmm 형식을 decimal degree로 변환한다.
-
-    예) 3732.55779, N, deg_digits=2  ->  37 + 32.55779/60
-        12702.16154, E, deg_digits=3 ->  127 + 02.16154/60
-    """
     if not value_str or len(value_str) <= deg_digits:
         return None
     allowed = {"N", "S"} if deg_digits == 2 else {"E", "W"}
@@ -241,7 +176,6 @@ def format_nmea_time(hhmmss):
 
 
 def parse_rmc(fields):
-    """RMC 필드를 파싱한다. talker가 GP든 GN이든 필드 위치는 동일하다."""
     if len(fields) < 10:
         return None
     lat_str, lat_hemi = fields[3].strip(), fields[4].strip().upper()
@@ -249,7 +183,13 @@ def parse_rmc(fields):
     lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
     lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
     if lat is None or lon is None:
-        return None
+        # 위경도 필드가 "비어 있고" status가 A가 아니면 = 그 순간 GPS fix가 없었던
+        # 정상 기록(status=V, mode=N)이므로 좌표만 공란으로 두고 행은 살린다.
+        # 필드에 값은 있는데 파싱이 안 되는 경우는 손상으로 보고 기존대로 버린다.
+        _status = fields[2].strip().upper() if len(fields) > 2 else ""
+        if lat_str or lon_str or _status == "A":
+            return None
+        lat = lon = None
 
     parse_warnings = []
     speed_knots = fields[7].strip() if len(fields) > 7 else ""
@@ -288,7 +228,6 @@ def parse_rmc(fields):
 
 
 def try_parse_rmc_sentence(raw):
-    """'$GNRMC,...*XX' 형태의 한 문장을 checksum 검증 + 필드 파싱까지 수행한다."""
     raw = raw.strip("\x00\r\n\t ")
     body_with_checksum = raw[1:] if raw.startswith("$") else raw
     checksum_ok = nmea_checksum_ok(body_with_checksum)
@@ -311,17 +250,7 @@ def try_parse_rmc_sentence(raw):
     return parsed
 
 
-# ---------------------------------------------------------------------------
-# 4. 파일 하나를 분석해서 "이 케이스에 해당하는가"를 먼저 판별
-# ---------------------------------------------------------------------------
 def locate_gps_source(f, filesize):
-    """moov를 찾고, 모든 trak의 hdlr을 확인한 뒤, text track이 없으면
-    moov -> udta -> mamt 를 찾아 (mamt Box)를 반환한다.
-
-    반환값: (mamt_box, reason)
-        - 이 파일이 대상 케이스이면 mamt_box는 Box 인스턴스, reason은 None
-        - 대상 케이스가 아니면 mamt_box는 None, reason은 사람이 읽을 수 있는 설명
-    """
     top_boxes = list(iter_boxes(f, 0, filesize, context="top-level"))
     top_types = [b.box_type for b in top_boxes]
 
@@ -344,7 +273,6 @@ def locate_gps_source(f, filesize):
     if not trak_boxes:
         return None, "moov 안에 trak Box가 하나도 없음"
 
-    # 모든 trak의 handler_type을 끝까지 확인한다 (첫 trak만 보고 판단하지 않는다).
     handler_types = []
     for trak_box in trak_boxes:
         handler_type = get_handler_type(f, trak_box)
@@ -371,18 +299,11 @@ def locate_gps_source(f, filesize):
     return mamt_box, None
 
 
-# ---------------------------------------------------------------------------
-# 5. mamt payload 안에서 $GNRMC/$GPRMC 문장을 가변 길이로 추출
-# ---------------------------------------------------------------------------
 def extract_rmc_sentences(payload, payload_abs_start):
-    """payload(bytes) 안에서 '$..RMC' 로 시작해 CRLF로 끝나는 문장들을 순서대로
-    추출한다. 문장 길이는 고정되어 있지 않으므로 매번 다음 CRLF까지 찾는다.
-    파싱에 실패한 문장이 있어도 다음 '$..RMC'부터 계속 진행한다.
-    """
-    sentences = []  # (abs_offset, raw_text)
+    sentences = []
     search_pos = 0
     n = len(payload)
-    pattern = re.compile(rb"\$G[NP]RMC")
+    pattern = re.compile(rb"\$[A-Z]{2}RMC")
     while search_pos < n:
         m = pattern.search(payload, search_pos)
         if not m:
@@ -396,13 +317,64 @@ def extract_rmc_sentences(payload, payload_abs_start):
             break
         raw = payload[start:end].decode("ascii", errors="replace")
         sentences.append((payload_abs_start + start, raw))
-        search_pos = end + 2  # CRLF 다음부터 다음 문장 탐색
+        search_pos = end + 2
     return sentences
 
 
 # ---------------------------------------------------------------------------
-# 6. 파일 하나 처리 -> CSV 등 출력
+# 재생 시간축 (루트 C: udta/mamt)
+#
+# 이 경로의 GPS 문장은 sample이 아니라 udta 밑 커스텀 박스에 그냥 나열돼 있어서
+# sample table(stts/tfdt)이 아예 없다. 즉 구조에서 시간을 뽑을 방법이 없다.
+# 대신 문장 자체가 UTC 시각을 들고 있고, 실측상 정확히 1Hz로 기록된다.
+#
+#   [20250901_215728D] 60행, 중복 시각 0개, '순번=경과초' 오차 0초
+#
+# 그래서 첫 문장의 UTC를 영상 0초로 놓고 경과초를 계산한다. 순번을 그대로 쓰지 않는
+# 이유는 GPS가 끊겨 문장이 빠지면 순번과 실제 시각이 어긋나기 때문이다.
 # ---------------------------------------------------------------------------
+def _utc_to_seconds(utc_time):
+    """'HH:MM:SS.ss' -> 자정 기준 초. 파싱 실패면 None."""
+    if not utc_time:
+        return None
+    try:
+        hh, mm, ss = utc_time.split(":")
+        return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    except (ValueError, AttributeError):
+        return None
+
+
+def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
+    """coord_rows에 start_time_sec/end_time_sec/time_source를 채운다.
+    첫 문장의 UTC가 0초. 자정을 넘어가면 하루(86400초)를 더해 이어붙인다."""
+    base = None
+    prev = None
+    carry = 0.0
+    assigned = 0
+    for row in coord_rows:
+        secs = _utc_to_seconds(row.get("utc_time"))
+        if secs is None:
+            row["start_time_sec"] = ""
+            row["end_time_sec"] = ""
+            row["time_source"] = ""
+            continue
+        if prev is not None and secs + carry < prev:
+            # 23:59:59 -> 00:00:00 처럼 되감기면 자정을 넘긴 것으로 본다.
+            carry += 86400.0
+        value = secs + carry
+        prev = value
+        if base is None:
+            base = value
+        start = value - base
+        row["start_time_sec"] = f"{start:.3f}"
+        row["end_time_sec"] = f"{start + nominal_interval:.3f}"
+        row["time_source"] = "gps_utc_elapsed"
+        assigned += 1
+    if coord_rows and assigned == 0:
+        warn("UTC 시각을 읽을 수 있는 GPS 문장이 없어 재생 시간축을 만들지 못함 "
+             "- start_time_sec 계열은 공란으로 둠")
+    return assigned
+
 def process_file(input_path, output_root):
     WARNINGS.clear()
     info("=" * 70)
@@ -459,8 +431,8 @@ def process_file(input_path, output_root):
                 "date": parsed.get("date", ""),
                 "utc_time": parsed.get("utc_time", ""),
                 "status": parsed.get("status", ""),
-                "latitude": f"{parsed['lat']:.6f}",
-                "longitude": f"{parsed['lon']:.6f}",
+                "latitude": f"{parsed['lat']:.6f}" if parsed.get("lat") is not None else "",
+                "longitude": f"{parsed['lon']:.6f}" if parsed.get("lon") is not None else "",
                 "speed_knots": parsed.get("speed_knots", ""),
                 "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
                 "track_deg": parsed.get("track_deg", ""),
@@ -472,24 +444,26 @@ def process_file(input_path, output_root):
                 "trusted": parsed.get("trusted", ""),
                 "parse_warnings": parsed.get("parse_warnings", ""),
                 "sequence": seq,
-                # AVI 원본의 idx1_entry_offset(스트림 청크의 idx1 offset) 대신,
-                # MP4에서는 해당 NMEA 문장이 파일 안에서 시작하는 절대 offset을 사용한다.
                 "idx1_entry_offset": f"0x{abs_offset:08X}",
-                # AVI 원본의 chunk_id(RIFF 4바이트 fourCC) 대신, 모든 GPS 문장이
-                # 단일 mamt 커스텀 박스에서 나오므로 고정값 "mamt"를 사용한다.
                 "chunk_id": "mamt",
                 "sentence_type": parsed["sentence_type"],
                 "raw_sentence": parsed["raw"],
             })
 
+    # 재생 시간축: 이 경로는 sample table이 없어 GPS UTC 경과초로 만든다.
+    assign_utc_elapsed_times(coord_rows)
+
     coordinates_txt = os.path.join(stream_dir, "coordinates.txt")
     with open(coordinates_txt, "w", encoding="utf-8") as f:
-        for i, row in enumerate(coord_rows, start=1):
+        # coordinates.txt는 "좌표 목록"이라 fix가 없어 좌표가 빈 행은 제외한다
+        # (그 행도 coordinates.csv에는 status=V로 그대로 남는다).
+        for i, row in enumerate([r for r in coord_rows if r["latitude"]], start=1):
             f.write(f"{i}. {row['latitude']}, {row['longitude']}\n")
 
     coordinates_csv = os.path.join(stream_dir, "coordinates.csv")
     with open(coordinates_csv, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
+            "start_time_sec", "end_time_sec", "time_source",
             "date", "utc_time", "status", "latitude", "longitude",
             "speed_knots", "speed_kmh", "track_deg", "magvar", "magvar_dir",
             "mode", "checksum_ok", "status_valid", "trusted", "parse_warnings",
@@ -523,8 +497,7 @@ def process_file(input_path, output_root):
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser()
     p.add_argument("output_dir", help="결과를 저장할 출력 디렉터리")
     p.add_argument("inputs", nargs="+", help="입력 MP4 파일 경로(여러 개 가능)")
     return p.parse_args(argv)
@@ -542,7 +515,7 @@ def main(argv=None):
             continue
         try:
             result = process_file(input_path, args.output_dir)
-        except Exception as exc:  # 배치 처리 중 한 파일이 실패해도 나머지는 계속 진행
+        except Exception as exc:
             warn(f"예외 발생으로 처리 중단: {exc}")
             result = {"ok": False, "reason": f"exception: {exc}"}
         results.append((input_path, result))

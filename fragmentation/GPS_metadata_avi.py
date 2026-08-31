@@ -88,6 +88,9 @@ class StreamInfo:
     role: str = "UNKNOWN"
     selected: bool = False
     unmapped: bool = False
+    dw_scale: int = None
+    dw_rate: int = None
+    dw_length: int = None
 
 
 def iter_chunks(mm, start, end, clamp_top_level=False):
@@ -220,6 +223,14 @@ def parse_hdrl(mm, hdrl_chunk):
                     if sc.ck_size >= 8:
                         si.fcc_type = bytes(mm[sc.data_start:sc.data_start + 4])
                         si.fcc_handler = bytes(mm[sc.data_start + 4:sc.data_start + 8])
+                    # 재생 시간축용 - strh 레이아웃상 dwScale(20)/dwRate(24)/dwLength(32).
+                    # 텍스트 스트림은 이 값이 0으로 깨져 있는 기기가 많아서(실측: VUGERA는
+                    # dwScale=0, INAVI FXD900은 dwRate=0) 여기서 읽어만 두고, 실제 시간
+                    # 계산은 영상 스트림 값을 기준으로 한다.
+                    if sc.ck_size >= 36:
+                        si.dw_scale = struct.unpack_from("<I", mm, sc.data_start + 20)[0]
+                        si.dw_rate = struct.unpack_from("<I", mm, sc.data_start + 24)[0]
+                        si.dw_length = struct.unpack_from("<I", mm, sc.data_start + 32)[0]
                 elif sc.ck_id == b"strf" and not sc.is_list:
                     si.has_strf = True
                 elif sc.ck_id == b"strn" and not sc.is_list:
@@ -640,7 +651,13 @@ def parse_rmc(fields):
     lat = _dm_to_decimal(lat_str, 2, lat_hemi, "S")
     lon = _dm_to_decimal(lon_str, 3, lon_hemi, "W")
     if lat is None or lon is None:
-        return None
+        # 위경도 필드가 "비어 있고" status가 A가 아니면 = 그 순간 GPS fix가 없었던
+        # 정상 기록(status=V, mode=N)이므로 좌표만 공란으로 두고 행은 살린다.
+        # 필드에 값은 있는데 파싱이 안 되는 경우는 손상으로 보고 기존대로 버린다.
+        _status = fields[2].strip().upper() if len(fields) > 2 else ""
+        if lat_str or lon_str or _status == "A":
+            return None
+        lat = lon = None
 
     parse_warnings = []
     speed_knots = fields[7].strip() if len(fields) > 7 else ""
@@ -731,8 +748,54 @@ def try_parse_nmea(line):
     parsed["trusted"] = bool(parsed.get("status_valid", True) and checksum_ok is not False and not parsed.get("parse_warnings"))
     return parsed
 
+# ---------------------------------------------------------------------------
+# 재생 시간축 (AVI)
+#
+# AVI의 텍스트 스트림은 strh의 dwScale/dwRate가 깨져 있는 기기가 많다. 실측:
+#     VUGERA MB-900SB : txts dwScale=0,   dwRate=30   -> 0으로 나누기
+#     INAVI FXD900    : txts dwScale=100, dwRate=0    -> 0 Hz
+# 그래서 텍스트 스트림 자신의 rate는 못 쓴다. 반면 영상 스트림은 멀쩡하다.
+#     VUGERA : vids 30.000 Hz, dwLength=1150 -> 38.3초 (txts dwLength도 1150 = 프레임 동기)
+#     FXD900 : vids 29.970 Hz, dwLength=1165 -> 38.9초 (txts dwLength=621 = 약 16Hz)
+#
+# 그래서 "영상 길이 / 텍스트 스트림 레코드 수"로 레코드 간격을 낸다. FXD900 교차검증:
+# GPS가 621개 중 39개라 약 16레코드마다 1개 = 1초 간격이 되는데, 실제 GPRMC의 UTC
+# 시각도 정확히 1초 간격이라 일치한다.
+#
+# ffprobe 같은 외부 도구를 쓰지 않는 이유: 그건 컨테이너 총 길이만 주지 "이 레코드가
+# 몇 초 지점인가"는 안 알려준다. 결국 여기서 하는 것과 같은 나눗셈이 필요하고,
+# 서드파티 디코더가 손상 구간을 임의로 보정해버리면 우리가 잡아낸 이상이 가려진다.
+# ---------------------------------------------------------------------------
+def compute_video_duration(mm, hdrl_chunk, stream_table):
+    """영상 스트림 strh로 재생 길이(초)를 구한다. 실패하면 avih로 폴백.
+    반환값: (duration_sec, source) - 못 구하면 (None, 사유)."""
+    for s in stream_table:
+        if s.fcc_type != b"vids":
+            continue
+        if s.dw_rate and s.dw_scale and s.dw_length:
+            fps = s.dw_rate / s.dw_scale
+            if fps > 0:
+                return s.dw_length / fps, f"vids strh({fps:.3f}fps x {s.dw_length}프레임)"
+
+    if hdrl_chunk is not None:
+        for child in iter_chunks(mm, hdrl_chunk.content_start, hdrl_chunk.content_end):
+            if child.ck_id == b"avih" and not child.is_list and child.ck_size >= 20:
+                usec = struct.unpack_from("<I", mm, child.data_start)[0]
+                frames = struct.unpack_from("<I", mm, child.data_start + 16)[0]
+                if usec and frames:
+                    return frames * usec / 1e6, f"avih({1e6/usec:.3f}fps x {frames}프레임)"
+    return None, "영상 스트림 strh와 avih 어디서도 재생 길이를 구할 수 없음"
+
+
+def build_avi_stream_times(video_duration, record_count):
+    """레코드 수로 균등 분할한 (start_sec, end_sec) 목록."""
+    if not video_duration or record_count <= 0:
+        return []
+    step = video_duration / record_count
+    return [(i * step, (i + 1) * step) for i in range(record_count)]
+
 def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
-                     dry_run=False):
+                     dry_run=False, stream_times=None):
     filesize = len(mm)
     chunk_id_to_stream = {}
     for s in selected_streams:
@@ -777,6 +840,11 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
         display_label, dir_label, prefix = labels[stream.index]
         seq = seq_counters[stream.index]
         seq_counters[stream.index] += 1
+        times = (stream_times or {}).get(stream.index) or []
+        start_sec, end_sec = times[seq] if seq < len(times) else (None, None)
+        time_source = "avi_video_duration" if start_sec is not None else ""
+        start_disp = f"{start_sec:.3f}" if start_sec is not None else ""
+        end_disp = f"{end_sec:.3f}" if end_sec is not None else ""
 
         output_file = ""
         if "OUT_OF_RANGE" not in reasons:
@@ -822,11 +890,14 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                     if parsed is not None:
                         speed_kmh = parsed.get("speed_kmh")
                         coord_rows_by_stream[stream.index].append({
+                            "start_time_sec": start_disp,
+                            "end_time_sec": end_disp,
+                            "time_source": time_source,
                             "date": parsed.get("date", ""),
                             "utc_time": parsed.get("utc_time", ""),
                             "status": parsed.get("status", ""),
-                            "latitude": f"{parsed['lat']:.6f}",
-                            "longitude": f"{parsed['lon']:.6f}",
+                            "latitude": f"{parsed['lat']:.6f}" if parsed.get("lat") is not None else "",
+                            "longitude": f"{parsed['lon']:.6f}" if parsed.get("lon") is not None else "",
                             "speed_knots": parsed.get("speed_knots", ""),
                             "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
                             "track_deg": parsed.get("track_deg", ""),
@@ -847,6 +918,9 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                         unparsed_by_stream[stream.index].append((seq, value))
                 elif kind == "float_vector":
                     row = {
+                        "start_time_sec": start_disp,
+                        "end_time_sec": end_disp,
+                        "time_source": time_source,
                         "sequence": seq,
                         "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
                         "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
@@ -949,6 +1023,69 @@ def decide_stream_kind(counts, min_fraction=DECODE_MIN_FRACTION):
     return None
 
 
+def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_run=False):
+    """GPS 스트림과 센서 스트림을 재생 시각 기준으로 한 줄에 합친 통합 타임라인.
+    AVI는 GPS와 G센서가 서로 다른 스트림(예: GPSR/SENS)에 들어있어서, 각 스트림에
+    이미 계산해둔 start_time_sec로 붙인다. 루트 A/B/C의 timeline.csv와 컬럼 구성을
+    맞춰서 시각화 쪽이 경로마다 다른 파일을 읽지 않아도 되게 한다.
+
+    AVI의 SENS(float32 벡터)는 이미 g 단위에 가까운 값이라(|v|가 1g 근처) MP4 쪽
+    gsensor처럼 카운트->g 보정을 하지 않는다. 그래서 x_g_cal 계열은 비워둔다.
+    """
+    if dry_run:
+        return None
+    coord_by_stream = extract_result["coord_rows_by_stream"]
+    sensor_by_stream = extract_result["sensor_rows_by_stream"]
+
+    gps_rows = []
+    for s in selected_streams:
+        rows = [r for r in coord_by_stream.get(s.index, []) if r.get("start_time_sec")]
+        if len(rows) > len(gps_rows):
+            gps_rows = rows
+    if not gps_rows:
+        return None
+
+    # 센서는 재생 시각(ms 단위 반올림)으로 찾는다. 같은 시각이 여러 개면 첫 번째를 쓴다.
+    sensor_at = {}
+    for s in selected_streams:
+        for r in sensor_by_stream.get(s.index, []):
+            key = r.get("start_time_sec")
+            if key and key not in sensor_at:
+                sensor_at[key] = r
+
+    rows = []
+    last_lat = last_lon = last_speed = ""
+    for i, r in enumerate(gps_rows, start=1):
+        if r.get("latitude"):
+            last_lat, last_lon = r["latitude"], r["longitude"]
+            last_speed = r.get("speed_kmh", "")
+        sen = sensor_at.get(r.get("start_time_sec"), {})
+        rows.append({
+            "sample": i,
+            "start_time_sec": r.get("start_time_sec", ""),
+            "end_time_sec": r.get("end_time_sec", ""),
+            "time_source": r.get("time_source", ""),
+            "latitude": r.get("latitude", ""),
+            "longitude": r.get("longitude", ""),
+            "speed_kmh": r.get("speed_kmh", ""),
+            "track_deg": r.get("track_deg", ""),
+            "gps_date": r.get("date", ""),
+            "gps_utc_time": r.get("utc_time", ""),
+            "gps_checksum_ok": r.get("checksum_ok", ""),
+            "latitude_last": last_lat,
+            "longitude_last": last_lon,
+            "speed_kmh_last": last_speed,
+            "x_g": sen.get("x", ""), "y_g": sen.get("y", ""), "z_g": sen.get("z", ""),
+            "x_g_cal": "", "y_g_cal": "", "z_g_cal": "",
+        })
+
+    path = os.path.join(out_dir, "timeline.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
 def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry_run=False):
     decode_summary = {}
     classify_counts = extract_result["classify_counts"]
@@ -973,12 +1110,15 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
 
             coordinates_txt = os.path.join(stream_dir, "coordinates.txt")
             with open(coordinates_txt, "w", encoding="utf-8") as f:
-                for i, row in enumerate(coord_rows, start=1):
+                # coordinates.txt는 "좌표 목록"이라 fix가 없어 좌표가 빈 행은 제외한다
+                # (그 행도 coordinates.csv에는 status=V로 그대로 남는다).
+                for i, row in enumerate([r for r in coord_rows if r["latitude"]], start=1):
                     f.write(f"{i}. {row['latitude']}, {row['longitude']}\n")
 
             coordinates_csv = os.path.join(stream_dir, "coordinates.csv")
             with open(coordinates_csv, "w", newline="", encoding="utf-8") as f:
                 fieldnames = [
+                    "start_time_sec", "end_time_sec", "time_source",
                     "date", "utc_time", "status", "latitude", "longitude",
                     "speed_knots", "speed_kmh", "track_deg", "magvar", "magvar_dir",
                     "mode", "checksum_ok", "status_valid", "trusted", "parse_warnings",
@@ -1004,10 +1144,12 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
             seen_value_fields = set()
             for row in sensor_rows:
                 for key in row:
-                    if key not in {"sequence", "idx1_entry_offset", "chunk_id", "vector_length"} and key not in seen_value_fields:
+                    if key not in {"sequence", "idx1_entry_offset", "chunk_id", "vector_length",
+                                    "start_time_sec", "end_time_sec", "time_source"} and key not in seen_value_fields:
                         seen_value_fields.add(key)
                         all_value_fields.append(key)
-            fieldnames = ["sequence", "idx1_entry_offset", "chunk_id", "vector_length"] + all_value_fields
+            fieldnames = ["start_time_sec", "end_time_sec", "time_source",
+                          "sequence", "idx1_entry_offset", "chunk_id", "vector_length"] + all_value_fields
             with open(sensor_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 w.writeheader()
@@ -1155,15 +1297,38 @@ def main(argv=None):
         if not selected_streams:
             warn("선택된 스트림이 없습니다. SELECT_MODE/조건을 확인하세요.")
 
+        # 재생 시간축: 텍스트 스트림 strh가 깨져 있는 기기가 많아 영상 스트림 길이를
+        # 레코드 수로 나눠 균등 간격을 만든다(자세한 근거는 compute_video_duration 참고).
+        video_duration, duration_source = compute_video_duration(mm, hdrl, stream_table)
+        if video_duration:
+            info(f"[시간축] 영상 길이 {video_duration:.3f}초 ({duration_source})")
+        else:
+            warn(f"[시간축] {duration_source} - start_time_sec 계열은 공란으로 둠")
+        entries_per_stream = {}
+        for e in idx1_entries:
+            sidx = stream_index_from_chunk_id(e["chunk_id"])
+            if sidx is not None:
+                entries_per_stream[sidx] = entries_per_stream.get(sidx, 0) + 1
+        stream_times = {}
+        for st in selected_streams:
+            n = entries_per_stream.get(st.index, 0)
+            stream_times[st.index] = build_avi_stream_times(video_duration, n)
+
         result = extract_payload(
             mm, args.output, selected_streams, idx1_entries, base_offset,
-            dry_run=args.dry_run)
+            dry_run=args.dry_run, stream_times=stream_times)
 
         save_metadata(args.output, result["index_rows"], stream_table,
                        result["labels"], dry_run=args.dry_run)
 
         decode_summary = write_decoded_outputs(
             args.output, selected_streams, result["labels"], result, dry_run=args.dry_run)
+
+        # GPS/센서를 재생 시각 기준 한 줄로 합친 통합 타임라인(시각화용).
+        n_timeline = write_avi_timeline(args.output, selected_streams, result["labels"],
+                                         result, dry_run=args.dry_run)
+        if n_timeline:
+            info(f"[시간축] timeline.csv {n_timeline}행 생성")
 
         info("\n" + "=" * 60)
         info("[요약]")

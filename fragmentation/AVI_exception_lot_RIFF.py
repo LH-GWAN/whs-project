@@ -27,6 +27,7 @@ chunk로 구조적으로 직접 찾는다 - 예전 스크립트처럼 전체 파
 찾는 방식은 JUNK나 압축 데이터 안에서 우연히 매치되는 위험이 있어 쓰지 않는다.
 """
 
+import argparse
 import glob
 import mmap
 import os
@@ -66,6 +67,32 @@ def _find_first_riff(mm):
     if size is None or bytes(mm[8:12]) != b"AVI ":
         return None
     return {"declared_size": size, "content_start": 12, "content_end": min(8 + size, filesize)}
+
+
+def _count_top_level_riffs(mm):
+    """최상위에서 연속으로 이어붙어 있는 유효한 RIFF 청크 개수를 선언된 크기만
+    따라가며 센다(문자열 검색 아님). 반환값: (개수, 마지막 RIFF가 끝나는 offset).
+
+    슬랙은 두 가지 형태로 나타난다 - (a) movi가 선언한 영역 *안에* 예전 녹화
+    파일이 통째로 남아있는 형태(find_embedded_riffs가 담당), (b) 최상위 RIFF가
+    2개 이상 그냥 이어붙어 있는 형태. 원래 이 스크립트는 (a)만 보고 있어서
+    (b)를 놓쳤다 - integration_avi.py와 같은 기준으로 맞춘다.
+    """
+    filesize = len(mm)
+    pos = 0
+    count = 0
+    while pos + 8 <= filesize:
+        if bytes(mm[pos:pos + 4]) != b"RIFF":
+            break
+        size = _u32le(mm, pos + 4)
+        if size is None:
+            break
+        end = pos + 8 + size
+        if end > filesize:
+            break
+        count += 1
+        pos = end + (size & 1)
+    return count, pos
 
 
 def _find_hdrl_movi_idx1(mm, riff):
@@ -186,10 +213,14 @@ def fix_blackbox_video(file_path, output_path):
 
             embedded = find_embedded_riffs(mm, movi["content_start"], movi["content_end"],
                                             riff["declared_size"])
-            if not embedded:
-                print(f"[-] {file_path}: movi 내부에서 예전 파일 잔재(슬랙)를 발견하지 "
-                      f"못했습니다 - 이미 깨끗하거나 이 스크립트가 다루는 손상 패턴이 "
-                      f"아닙니다.")
+            top_riff_count, consumed_end = _count_top_level_riffs(mm)
+            if top_riff_count >= 2:
+                print(f"    [+] 최상위 RIFF가 {top_riff_count}개 이어붙어 있음 "
+                      f"(첫 RIFF 끝=0x{riff['content_end']:X}, 전체 소비 끝=0x{consumed_end:X}) "
+                      f"- 중복 RIFF 슬랙으로 판단")
+            if not embedded and top_riff_count < 2:
+                print(f"[-] {file_path}: movi 내부 예전 파일 잔재도 없고 최상위 RIFF도 1개뿐 "
+                      f"- 이미 깨끗하거나 이 스크립트가 다루는 손상 패턴이 아닙니다.")
                 return False
 
             for e in embedded:
@@ -293,12 +324,17 @@ def fix_blackbox_video(file_path, output_path):
             mm.close()
 
 
-def process_all_samples(input_folder, output_folder):
-    os.makedirs(output_folder, exist_ok=True)
-    files = glob.glob(os.path.join(input_folder, "REC_*.avi"))
+def process_all_samples(input_folder, output_folder, pattern="*.avi"):
+    # 출력 폴더는 처리할 파일이 실제로 있을 때만 만든다. 예전엔 여기서 무조건
+    # makedirs를 해서, 대상이 하나도 없어도 빈 Recovered_2 폴더만 남았다.
+    # 원래 "REC_*.avi"로 고정돼 있어서 EVT_ 등 다른 이름은 조용히 건너뛰었다.
+    # 슬랙 판단은 파일명이 아니라 구조(임베디드 RIFF / 최상위 RIFF 개수)로 하므로
+    # 기본값을 모든 .avi로 넓힌다 - 슬랙이 없는 파일은 어차피 스킵된다.
+    files = sorted(glob.glob(os.path.join(input_folder, pattern)))
     if not files:
         print(f"'{input_folder}' 폴더 내에 처리할 .avi 파일이 없습니다.")
         return
+    os.makedirs(output_folder, exist_ok=True)
     print(f"총 {len(files)}개의 파일을 발견했습니다. 작업을 시작합니다...\n")
     print("-" * 40)
     success_count = 0
@@ -311,7 +347,19 @@ def process_all_samples(input_folder, output_folder):
     print(f"작업 완료! (성공: {success_count}개)")
 
 
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description="AVI 슬랙(예전 녹화 파일 잔재) 제거 - integration_avi.py에 같은 기능이 "
+                    "통합돼 있으므로 보통은 그쪽을 쓰고, 이 스크립트는 슬랙 리페어만 "
+                    "단독으로 돌리고 싶을 때 쓴다.")
+    p.add_argument("-i", "--input-dir", default=".", help="입력 폴더 (기본: 현재 폴더)")
+    p.add_argument("-o", "--output-dir", default="./Recovered_2",
+                   help="결과 폴더 (기본: ./Recovered_2)")
+    p.add_argument("--pattern", default="*.avi",
+                   help="처리할 파일 glob 패턴 (기본: *.avi)")
+    args = p.parse_args(argv)
+    process_all_samples(args.input_dir, args.output_dir, args.pattern)
+
+
 if __name__ == "__main__":
-    INPUT_DIR = "."
-    OUTPUT_DIR = "./Recovered_2"
-    process_all_samples(INPUT_DIR, OUTPUT_DIR)
+    main()

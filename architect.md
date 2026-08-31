@@ -7,6 +7,16 @@
 ## 파일 구성과 관계
 
 ```
+integration_blackbox.py
+    ← 최상위 진입점. 파일 시그니처로 AVI/MP4를 판별해 아래 두 통합 스크립트로 넘긴다.
+      이 프로젝트에서 유일하게 다른 스크립트를 import하는 파일(integration_avi /
+      integration_mp4를 모듈로 불러 main()을 호출). 자기 파싱 로직은 없다.
+mp4_slack_carve.py
+    ← MP4 슬랙(free/skip Box, Box 사이 gap, 꼬리) 카빙 단독 스크립트.
+      integration_mp4.py 안에 같은 로직이 복사돼 있어 보통은 그쪽으로 자동 수행됨.
+      ※ AVI_exception_lot_RIFF.py와는 목적이 반대다 - 저쪽은 슬랙을 "잘라내"
+        깨끗한 재생용 사본을 만들고(AVI 슬랙은 movi 안에 박혀 재생을 방해),
+        이쪽은 슬랙에서 데이터를 "건져낸다"(MP4 슬랙은 free로 선언돼 있어 자를 이유 없음).
 GPS_metadata_avi.py
     ← AVI 핵심 엔진 (AVI/RIFF 저수준 파서 + 자동 디코딩)
 GPS_metadata_GPRMC.py
@@ -22,9 +32,10 @@ GPS_metadata_mp4_pvc1_Atext.py
 GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py
     ← 독립 스크립트 (MP4/ISO BMFF, pvc1과 반대로 text track이 "없는" 경우 전용 —
       moov/udta/mamt 커스텀 박스, pvc1과 코드 import 관계 없음)
-GPS_metadata_fregment_iso4_Atext.py
+GPS_metadata_fragment_iso4_Atext.py
     ← 독립 스크립트 (Fragmented MP4, moof/traf/trun 구조, pvc1과 코드 import 관계 없음
-      — Atext 해석 알고리즘만 재구현)
+      — Atext 해석 알고리즘만 재구현, 세그먼트 구분자/미확정 벤더 레코드 처리는 pvc1보다
+      일반화돼 있음, 아래 참고)
 ```
 
 - AVI 두 스크립트(`GPS_metadata_avi.py`, `GPS_metadata_GPRMC.py`)는 같은 RIFF 파서를 쓴다.
@@ -38,26 +49,80 @@ GPS_metadata_fregment_iso4_Atext.py
   다수결로 스트림 종류 확정)가 이미 같은 목적을 커버하기 때문. 출력 폴더 형식은 `GPS_metadata_
   GPRMC.py`(`raw_chunks/`, `text_detection.csv`)가 아니라 `GPS_metadata_avi.py` 쪽(`chunks/`,
   `index.csv`, `decode_detection.csv` 등, 더 상위 호환) 하나로 통일했다.
-- MP4 스크립트 세 개(pvc1/udta_mamt/fregment)는 컨테이너 포맷 자체가 달라서(RIFF/idx1 vs
+- MP4 스크립트 세 개(pvc1/udta_mamt/fragment)는 컨테이너 포맷 자체가 달라서(RIFF/idx1 vs
   ISO BMFF box 트리) AVI 쪽과 코드 공유가 없다. 셋끼리도 서로 import하지 않는다 — moov
   하위의 일반 Sample Table(`stsc`/`stsz`/`stco`)로 offset을 구하는 pvc1, GPS가 Sample Table이
   아니라 `moov/udta` 밑 커스텀 박스(`mamt`) 안에 통째로 들어있는 udta_mamt, `moof`/`traf`/
-  `tfhd`/`tfdt`/`trun`을 매 조각마다 다시 계산해야 하는 fregment는 "GPS 데이터가 어디 있고
+  `tfhd`/`tfdt`/`trun`을 매 조각마다 다시 계산해야 하는 fragment는 "GPS 데이터가 어디 있고
   어떻게 offset을 구하는지" 자체가 셋 다 달라서 그 부분은 완전히 별도 구현.
-  - pvc1과 fregment는 Sample을 읽어낸 **다음부터의 Atext 문자열 해석 로직**(길이 프리픽스
-    검증, `;` 세그먼트 분리, gsensor 정규식, NMEA 판별)이 같은 장비/같은 포맷이라 알고리즘을
-    그대로 복사해서 fregment 쪽에 재구현해뒀다(코드 공유 아님 — pvc1을 고쳐도 fregment는
-    안 바뀜).
+  - pvc1과 fragment는 Sample을 읽어낸 **다음부터의 Atext 문자열 해석 로직**(길이 프리픽스
+    검증, 세그먼트 분리, gsensor 정규식, NMEA 판별)이 같은 계열 장비/포맷이라 알고리즘을
+    복사해서 fragment 쪽에 재구현해뒀다(코드 공유 아님 — pvc1을 고쳐도 fragment는
+    안 바뀜). 단, 세그먼트 분리 로직은 fragment 쪽이 실측(Mercedes-Benz)으로 더
+    일반화돼 있어 둘이 완전히 동일하지는 않다 — 아래 fragment 항목 참고.
   - udta_mamt는 애초에 Atext/Sample Table을 전혀 안 쓰는 다른 장비/포맷(`mamt` 박스 안에
-    `$GNRMC` NMEA 문장이 그대로 텍스트로 나열)이라 pvc1/fregment의 Atext 해석 로직과는
+    `$GNRMC` NMEA 문장이 그대로 텍스트로 나열)이라 pvc1/fragment의 Atext 해석 로직과는
     아예 무관하고, box 트리 순회 방식(`iter_boxes`, size==0/1 처리, 부모 경계 체크)만
     관례적으로 동일하게 재구현했다.
-- 다섯 파싱 스크립트(avi, GPRMC, mp4 pvc1, mp4 udta_mamt, mp4 fregment) 모두 NMEA 파싱
-  로직(`parse_rmc`, `parse_gga`(fregment/pvc1/avi만 — udta_mamt는 RMC만 지원),
+- 다섯 파싱 스크립트(avi, GPRMC, mp4 pvc1, mp4 udta_mamt, mp4 fragment) 모두 NMEA 파싱
+  로직(`parse_rmc`, `parse_gga`(fragment/pvc1/avi만 — udta_mamt는 RMC만 지원),
   `_dm_to_decimal`, `nmea_checksum_ok` 등)은 동일한 알고리즘을 각자 파일에 중복 보유하고
   있음(import로 묶지 않고 파일마다 복사됨 — 다섯 중 하나만 고치면 나머지는 안 바뀌니 주의).
+  ⚠ 현재 `nmea_checksum_ok`는 fragment 사본만 버그 수정된 상태(`re.fullmatch`→`re.match`,
+  아래 fragment 항목 참고)라 다섯 사본이 더 이상 완전히 동일하지 않다 — 다른 네 스크립트도
+  체크섬 뒤에 예상 못 한 데이터가 붙는 장비를 만나면 같은 오탐이 날 수 있으므로, 그런
+  증상이 보이면 이 수정을 이식할 것.
 
 ---
+
+## integration_blackbox.py — 최상위 진입점
+
+파일이 AVI인지 MP4인지 판별해서 `integration_avi.py` / `integration_mp4.py` 로 넘긴다.
+자기 파싱 로직은 없고, 이 프로젝트에서 **유일하게 다른 스크립트를 import하는 파일**이다
+(두 통합 스크립트를 모듈로 불러 `main(argv)`를 호출). 나머지 스크립트들이 코드를 복사해
+갖고 있는 것과 달리, 여기서는 복사할 이유가 없다 - 하는 일이 "어느 쪽으로 보낼지 정하고
+그대로 넘기기"뿐이라 중복시킬 로직 자체가 없다.
+
+### 판별 (`detect_container`)
+
+확장자를 안 본다. 확장자는 언제든 바뀔 수 있고 포렌식 대상이면 더 못 믿는다. 게다가 이
+프로젝트에서 이미 "선언된 메타데이터를 믿으면 틀린다"를 겪었다 - MP4 통합 때 ftyp의
+major_brand로 분기하려다가 같은 `avc1`이 non-fragmented(INAVI Z300)와 fragmented(신규
+Ambarella) 양쪽에 다 쓰이는 걸 확인하고 구조 기반으로 바꿨다. 그래서 여기서도 파일 앞
+16바이트를 직접 읽는다.
+
+| 판별 | 조건 |
+|---|---|
+| AVI | `offset 0 == "RIFF"` 이고 `offset 8 == "AVI "` |
+| MP4 | `offset 4 == "ftyp"` (ISO BMFF는 첫 Box가 ftyp인 게 표준) |
+| MP4 | ftyp가 없어도 첫 Box 타입이 `moov`/`mdat`/`moof`/`free`/`skip`/`wide`/`pnot` 이면 ISO BMFF 변종으로 인정 |
+| 불가 | RIFF인데 formType이 AVI가 아님(예: `WAVE`) / 12바이트 미만 / 둘 다 아님 |
+
+확장자와 내용이 다르면 `check_extension_mismatch`가 경고를 남기지만 **판별은 내용을 따른다**
+(확장자가 틀린 것이지 데이터가 틀린 게 아니므로). 처리 불가 파일은 사유를 적고 그 파일만
+건너뛰며, 나머지는 계속 처리된다.
+
+### 실행 (`main`)
+
+입력을 AVI 묶음 / MP4 묶음으로 나눠 각 통합 스크립트의 `main()`을 한 번씩 호출한다.
+같은 프로세스 안에서 돌리므로 출력 폴더 구조와 결과물은 각각을 직접 실행했을 때와 동일하다.
+
+- 공용 옵션: `--dry-run`, `--no-slack`(MP4 그룹에만 전달), `--detect-only`.
+- 하위 고유 옵션: `--avi-opt=` / `--mp4-opt=` 로 넘긴다. 값이 `-`로 시작하면 argparse가
+  옵션으로 오인하므로 **반드시 `=` 형태로 붙여 써야 한다**(`--mp4-opt="--track-id 3"`).
+  받은 문자열은 `shlex.split`으로 쪼개 그대로 전달한다.
+- 하위 `main()` 호출을 `SystemExit`/`Exception`으로 감싼다. `integration_avi.py`의
+  `assert_riff_file`처럼 `sys.exit`을 부르는 코드가 있어서, 안 잡으면 AVI 그룹이 죽을 때
+  뒤이은 MP4 그룹까지 같이 죽는다. 실제로 잘못된 하위 옵션을 준 그룹만 실패하고 다른
+  그룹은 정상 처리되는 걸 확인했다.
+
+### 검증
+
+샘플 19개(AVI 7 + MP4 12)를 이 진입점으로 한 번에 돌린 결과와 `integration_avi.py` /
+`integration_mp4.py`를 따로 돌린 결과를 파일 단위 sha256으로 대조 - **산출물 16,671개 전부
+일치, 누락/추가 0건**. 확장자 위장(내용 AVI인데 `.mp4`, 내용 MP4인데 `.avi`), RIFF/WAVE,
+8바이트 파일, ftyp 없는 moov 시작 변종, 컨테이너가 아닌 바이트열을 합성해 판별 경로도
+전부 확인했다.
 
 ## GPS_metadata_avi.py — AVI 핵심 엔진
 
@@ -129,6 +194,12 @@ AVI는 RIFF 컨테이너: `RIFF` → `LIST hdrl`(스트림 정의) / `LIST movi`
 ### NMEA 파싱 규칙 (`try_parse_nmea` 계열, 네 스크립트 공통)
 
 - `$GPRMC,...*hh` 형식에서 talker(GP 등) + sentence type(RMC/GGA)만 지원.
+- **fix가 없던 순간(`status=V`)도 행으로 남긴다**: RMC의 위경도 필드가 **비어 있고**
+  `status`가 `A`가 아니면 "그 순간 위성을 못 잡음"이라는 정상 기록으로 보고 `lat`/`lon`을
+  `None`으로 두되 나머지 필드는 그대로 채운 dict를 돌려준다 → `coordinates.csv`에는
+  좌표/속도만 공란인 행으로 들어가고, `coordinates.txt`(좌표 목록)에서는 제외된다.
+  반대로 위경도 필드에 **값은 있는데 파싱이 안 되는** 경우는 손상으로 보고 예전처럼
+  `None`을 반환해 `unparsed_lines.txt`로 보낸다 — 이 둘을 구분하는 게 핵심이다.
 - 위경도는 `_dm_to_decimal`로 NMEA degree-minute(`ddmm.mmmm`) → 십진도 변환,
   남/서(S/W)면 부호를 음수로 뒤집어서 **부호 있는 십진도로 통일**(N/E=+, S/W=-).
   즉 N/S, E/W 문자는 결과에 안 남기고 부호로만 표현 — 좌표를 그대로 지도에 찍으면 됨.
@@ -245,7 +316,11 @@ AVI와 컨테이너가 완전히 다름(ISO BMFF: `moov` → `trak` → `mdia` �
 ├── warnings.log
 └── TRACK<N>_TEXT/                      지원 handler(text/sbtl/subt) Track마다 (N은 전체 순번)
     ├── index.csv                        Sample별 chunk/offset/size/validation
-    ├── coordinates.csv/.txt             GPRMC/GPGGA 인식된 것만
+    ├── coordinates.csv/.txt             GPRMC/GPGGA 인식된 것만. NMEA 필드 컬럼은 AVI 쪽
+    │                                     (GPS_metadata_GPRMC.py)과 동일하게 맞춤 —
+    │                                     magvar/magvar_dir/mode 포함. AVI 고유 위치 컬럼
+    │                                     (sequence/idx1_entry_offset/chunk_id) 자리에는
+    │                                     MP4 고유의 `sample`(Sample 번호)이 들어감
     ├── sensor_values.csv                gsensor 세그먼트 원본 필드 그대로 (⚠ 비공식)
     ├── other_segments_unparsed.csv      gsensor도 GPS도 아닌 나머지 (CAR 등)
     ├── keyword_hits.csv                 키워드 후보 표시(해석 아님)
@@ -268,13 +343,13 @@ pvc1과 정확히 반대 조건을 다루는 스크립트다. non-fragmented MP4
 
 ### 정보를 찾는 방법 (box 트리 순회 + "이 케이스가 맞는지" 사전 판별)
 
-1. **`iter_boxes`**: pvc1/fregment와 같은 원리(`size==1`→64bit extended size, `size==0`→
+1. **`iter_boxes`**: pvc1/fragment와 같은 원리(`size==1`→64bit extended size, `size==0`→
    "부모 끝까지", 부모 경계를 넘으면 경고 후 그 레벨 순회 중단)로 top-level부터 순회.
    문자열 블라인드 스캔은 전혀 안 쓰고 size 필드만으로 다음 박스 위치를 계산한다.
 2. **`locate_gps_source`**: 이 파일이 정말 "text track 없음 + udta/mamt" 케이스인지부터
    순서대로 확인하고, 아니면 처리하지 않고 이유를 알려준다.
    - top-level에 `moof`가 있고 `moov`가 없으면 → fragmented mp4로 보고 스킵
-     (`GPS_metadata_fregment_iso4_Atext.py` 사용 권장).
+     (`GPS_metadata_fragment_iso4_Atext.py` 사용 권장).
    - `moov`가 없거나 그 안에 `trak`이 하나도 없으면 → 스킵.
    - **모든 `trak`의 `trak/mdia/hdlr`을 끝까지 확인**(`get_handler_type`, 첫 trak만 보고
      판단하지 않음)해서 handler_type이 `text`/`sbtl`/`subt` 중 하나라도 있으면 → 이건
@@ -297,11 +372,14 @@ pvc1과 정확히 반대 조건을 다루는 스크립트다. non-fragmented MP4
 1. `mamt` 박스도 `[size|type="mamt"|payload]` 형태의 평범한 박스로 보고, **payload
    범위(`mamt_start+8` ~ `mamt_start+size`)를 먼저 확정한 뒤** 그 범위 안에서만 검색한다
    — 파일 전체에서 `$GNRMC`를 찾지 않는다.
-2. **`extract_rmc_sentences`**: `mamt` payload 안에서 정규식 `\$G[NP]RMC`(talker가 GN이든
-   GP든 매치)로 문장 시작을 찾고, 그 지점부터 최초의 `CRLF(0D 0A)`까지를 한 문장으로 잘라
-   낸다. 문장 길이가 고정이 아니므로 매번 다시 CRLF를 찾아야 하고, 다음 검색은 방금 자른
-   문장의 끝(CRLF 다음)부터 이어서 하므로 같은 문장을 중복으로 못 찾는다. CRLF를 못 찾으면
-   (데이터가 잘렸거나 손상) 그 지점에서 경고를 남기고 추출을 종료한다.
+2. **`extract_rmc_sentences`**: `mamt` payload 안에서 정규식 `\$[A-Z]{2}RMC`(talker 2글자는
+   뭐든 매치 — GN/GP뿐 아니라 GL(GLONASS)/GA(Galileo)/GB·BD(BeiDou)/GQ(QZSS) 등도 전부 잡음.
+   처음엔 실제 관찰된 GN/GP만 `\$G[NP]RMC`로 하드코딩했다가, 다른 talker를 쓰는 멀티-GNSS
+   장비에서 조용히 다 놓치는 문제라 일반화함)로 문장 시작을 찾고, 그 지점부터 최초의
+   `CRLF(0D 0A)`까지를 한 문장으로 잘라낸다. 문장 길이가 고정이 아니므로 매번 다시 CRLF를
+   찾아야 하고, 다음 검색은 방금 자른 문장의 끝(CRLF 다음)부터 이어서 하므로 같은 문장을
+   중복으로 못 찾는다. CRLF를 못 찾으면(데이터가 잘렸거나 손상) 그 지점에서 경고를 남기고
+   추출을 종료한다.
 3. **`try_parse_rmc_sentence`**: 자른 문장을 `nmea_checksum_ok`로 checksum 검증(결과는
    파싱 성공 여부와 무관하게 `checksum_ok` 컬럼에 별도 기록), `,`로 필드 분리 후
    sentence type이 `RMC`가 아니면 버림(`GGA`는 이 장비에서 관찰되지 않아 미지원). 특정
@@ -309,10 +387,11 @@ pvc1과 정확히 반대 조건을 다루는 스크립트다. non-fragmented MP4
    보내고 다음 `$GxRMC` 탐색을 계속한다 — 손상된 문장 때문에 이후 데이터 전체를 놓치지
    않게 하기 위함.
    - `status=="V"`(GPS fix 없음, 위경도 필드가 비어있는 정상적인 NMEA 상태)인 문장은
-     `GPS_metadata_avi.py`의 `parse_rmc`와 동일한 기존 규약대로 좌표를 만들 수 없어
-     `coordinates.csv`에는 안 들어가고 `unparsed_lines.txt`에 원문만 보존된다 — 파싱
-     실패가 아니라 "그 순간 GPS 신호가 없었다"는 정상적인 데이터로, 별도 컬럼 구분 없이
-     기존 다섯 스크립트 공통 규약을 그대로 따른 것.
+     **`coordinates.csv`에 행으로 남긴다** — 좌표/속도만 공란이고 나머지(date, utc_time,
+     status=V, mode=N, status_valid=False, trusted=False, checksum_ok, raw_sentence,
+     절대 offset)는 전부 채워진다. 파싱 실패가 아니라 "그 순간 GPS 신호가 없었다"는
+     정상 기록이라, 행 자체를 버리면 시계열에서 "끊긴 구간"과 "애초에 데이터가 없는
+     구간"을 구분할 수 없기 때문. 다섯 스크립트 공통 규약이다.
 4. 위경도 decimal 변환(`_dm_to_decimal`), 날짜/시각 포맷(`format_nmea_date`/
    `format_nmea_time`), knots→km/h 환산(`*1.852`) 로직은 `GPS_metadata_avi.py`와 동일한
    알고리즘을 파일 안에 그대로 복사해뒀다(공통 설계 원칙 참고 — import 아님).
@@ -349,14 +428,18 @@ OK/SKIP 요약을 출력한다. Land Rover 대시캠 샘플 3개(`20250901_20411
 
 ---
 
-## GPS_metadata_fregment_iso4_Atext.py — Fragmented MP4(iso4, moof/traf/trun) 전용
+## GPS_metadata_fragment_iso4_Atext.py — Fragmented MP4(iso4, moof/traf/trun) 전용
 
-GPS_metadata_mp4_pvc1_Atext.py와 같은 장비/같은 Atext 텍스트 포맷(`gsensor...;GPRMC...;
-CAR...`)을 다루지만, 컨테이너가 Fragmented MP4(`ftyp` major_brand=`iso4`)라 `moov` 안에
-pvc1이 의존하는 `stsc`/`stsz`/`stco` 같은 일반 Sample Table이 아예 없다. 대신 `moof`+`mdat`
-쌍이 파일 끝까지 반복되면서, 매 조각(`moof`)마다 `tfhd`/`tfdt`/`trun`으로 그때그때
-offset/size/시간을 다시 계산해야 하는 구조라 offset 계산 부분은 pvc1과 완전히 별도로
-새로 구현했다(문자열 검색은 전혀 안 쓰고 box size 필드만으로 트리를 순회하는 원칙은 동일).
+GPS_metadata_mp4_pvc1_Atext.py와 같은 계열 장비(Ambarella 기반, Atext 트랙에 GPS/센서를
+같이 실어보내는 방식)를 다루지만, 컨테이너가 Fragmented MP4(`ftyp` major_brand=`iso4`)라
+`moov` 안에 pvc1이 의존하는 `stsc`/`stsz`/`stco` 같은 일반 Sample Table이 아예 없다. 대신
+`moof`+`mdat` 쌍이 파일 끝까지 반복되면서, 매 조각(`moof`)마다 `tfhd`/`tfdt`/`trun`으로
+그때그때 offset/size/시간을 다시 계산해야 하는 구조라 offset 계산 부분은 pvc1과 완전히
+별도로 새로 구현했다(문자열 검색은 전혀 안 쓰고 box size 필드만으로 트리를 순회하는
+원칙은 동일). INAVI QXD8000(`REC_20240312_082217_F.mp4`)과 Mercedes-Benz Drive View
+(`20240411_144016E.MP4`) 둘 다 이 케이스로 실측 검증했다 — 아래 "Atext 해석" 항목에서
+보듯 두 장비의 Atext 내용물 포맷이 서로 달라서, 처음엔 INAVI 기준으로만 짜여 있던 세그먼트
+분리/체크섬 검증 로직에 버그가 있었고 Mercedes-Benz 샘플로 실측하다가 발견해서 고쳤다.
 
 ### 정보를 찾는 방법 (box 트리 순회)
 
@@ -397,25 +480,55 @@ offset/size/시간을 다시 계산해야 하는 구조라 offset 계산 부분�
    sample의 duration만큼 누적(`current_dts += duration`)한 뒤 `mdhd.timescale`로 나눠서
    초 단위 시작/종료 시각(`start_time`/`end_time`)을 계산한다 — pvc1 스크립트에는 없던,
    "영상 재생 시간과 metadata를 동기화"하기 위해 이 스크립트에서 새로 추가한 부분.
-2. Sample 원본 바이트를 읽은 뒤부터는 pvc1과 같은 알고리즘을 그대로 재구현해서 씀:
+2. Sample 원본 바이트를 읽은 뒤부터는 pvc1과 비슷한 알고리즘을 재구현해서 씀:
    앞 2바이트 길이 프리픽스 검증(`decode_sample_text`, `declared_len + 2 == 전체 크기`일
-   때만 신뢰) → `;`로 세그먼트 분리(`split_segments`) → `classify_segment`로 `gsensor`/
-   `gps_nmea`/`generic` 판정.
-3. pvc1과 다른 점: `classify_segment` 결과 중 `gsensor`/`gps_nmea`(GPRMC + GPGGA) 두
-   종류만 최종 결과(`KEPT_KINDS`)로 남기고 `generic`(예: `CAR,...`)은 그 자리에서 버린다
-   — "GPS/속도/위치 시각화"라는 목적에 필요 없는 데이터라 사용자 요청으로 필터링한 것.
-   실제 원본 파일(`REC_20240312_082217_F.mp4`)을 이 스크립트와 완전히 별개인 코드로
-   직접 재파싱해서 gsensor(600)/GPRMC(60)/CAR(600) 세 종류 외 다른 세그먼트가 없다는
-   것을 확인한 뒤 내린 결정 — 필터링으로 놓치는 정보가 없음을 검증함.
-4. gsensor 세그먼트 필드(`gsensor<subtype>,<count>,<scale>,<x>,<y>,<z>`)는 pvc1처럼
+   때만 신뢰) → 세그먼트 분리(`split_segments`) → `classify_segment`로 `gsensor`/
+   `gps_nmea`/`vendor_raw`/`generic` 판정. 단 세그먼트 분리는 pvc1의 단순 `;`-split이
+   아니라 아래처럼 일반화돼 있다.
+3. **세그먼트 분리 일반화(`split_segments`)**: INAVI는 `;`로 세그먼트를 구분하는데
+   (`gsensor...;GPRMC...*60\r\n;CAR,...`), Mercedes-Benz 실측 샘플에서는 GPRMC 문장과
+   그 뒤 벤더 서브레코드가 `\r\n`으로만 구분되고, 그 서브레코드들끼리는 아무 구분자 없이
+   `$`로 시작하는 문장이 그냥 이어붙어 있음(`$M4,...$M4,...$V14400$Z55`)이 확인됐다.
+   그래서 1차로 `;`/`\r\n`/`\n` 전부를 구분자로 인정하도록 정규식을 넓혔고, 남은 조각
+   안에 `$`가 2개 이상 있으면(구분자 없이 여러 문장이 붙어있다는 뜻) 그 등장 위치를
+   문장 시작으로 보고 2차로 재분리한다(`re.split(r"(?=\$)", chunk)`). INAVI 쪽 결과는
+   이 변경 전후로 완전히 동일함을 재검증했다(GPS 60/60, GSENSOR 600/600 그대로).
+4. **NMEA 체크섬 버그와 수정**: 세그먼트 분리가 안 되던 시절엔 `*36` 뒤에 다음 세그먼트
+   원문이 그대로 딸려 들어가서, `nmea_checksum_ok`가 그 잔여 텍스트 전체에 대해
+   `re.fullmatch(r"[0-9A-Fa-f]{2}.*", csum)`를 걸었는데 그 잔여 텍스트 안에 `\r\n`이
+   섞여 있어(정규식 `.`이 기본적으로 개행을 못 건너뜀) fullmatch가 실패, 실제 체크섬은
+   맞는데도 `checksum_ok=False`로 오탐이 났다(Mercedes-Benz 샘플 59건 전부 재현·확인).
+   체크섬 검증에는 원래 `*` 뒤 2자리 hex만 있으면 충분하므로 `re.fullmatch`를
+   `re.match`로 바꿔 앞 2자리만 보도록 고쳤다 — 위 세그먼트 분리 수정과 별개로도 유효한
+   방어적 수정(다른 벤더가 체크섬 뒤에 뭘 더 붙이는 경우에도 안전). 수정 후 Mercedes-Benz
+   60/60, INAVI 60/60 모두 `checksum_ok=True`로 재검증함.
+5. **`vendor_raw`(미확정 벤더 레코드)**: `classify_segment`에서 gsensor/NMEA 어느 쪽에도
+   안 걸리는 세그먼트 중 `^\$(?P<tag>[A-Za-z]+)(?P<rest>.*)$` 형태(`$`로 시작하고 태그
+   뒤에 필드가 옴)만 별도로 `vendor_raw`로 분류해 태그+필드+원본을 그대로 보존한다(필드는
+   해석하지 않고 `confirmed: False`로 표시). Mercedes-Benz 샘플의 `$M`(20Hz 정도의
+   서브레코드로 보임, 뒤쪽 6개 필드가 `YY,MM,DD,HH,MM,SS` 로컬시각(KST)과 정확히 일치 —
+   GPRMC의 UTC 시각과 9시간 차이로 대조 확인함)/`$V`(값이 14300~14400 범위라 배터리
+   전압 `14.xxx V`로 추정)/`$Z`(20초 사이 55→56으로 서서히 증가, 내부 온도(°C) 추정)가
+   이 경로로 잡힌다 — 전부 공식 스펙이 아니라 패턴 관찰로 세운 가설이라 필드 이름 자체를
+   붙이지 않았다. `$` 접두어가 없는 미확정 세그먼트(INAVI의 `CAR,...` 등)는 여전히
+   `generic`으로 분류돼 `KEPT_KINDS`(`gsensor`/`gps_nmea`/`vendor_raw`)에 안 들어가고
+   버려진다 — pvc1이 "GPS/속도/위치 시각화에 불필요한 나머지는 버린다"는 원래 방침은
+   그대로 유지하되, "$-접두 미확정 레코드는 의미를 몰라도 원본을 잃지 않는다"는 원칙을
+   추가한 것.
+6. gsensor 세그먼트 필드(`gsensor<subtype>,<count>,<scale>,<x>,<y>,<z>`)는 pvc1처럼
    `field_0, field_1, ...`로 원본만 보존하는 대신, 실측 데이터로 의미를 역산해서 이름을
-   붙였다(⚠ 공식 스펙 아님) — `count`는 파일 전체에서 항상 "4"(뒤에 오는 값 개수),
-   `scale`은 항상 "2048"(1g당 카운트 수)로 일관되게 나타나 `x_raw/scale = x_g` 식으로
-   g 단위 값도 같이 산출해서 저장.
-5. `timeline.csv`: GPS(1Hz)와 G센서(10Hz)를 sample 단위(0.1초 간격)로 한 줄씩 합친 통합
-   타임라인 — GPRMC가 없는 sample은 `latitude`/`longitude` 등을 공란으로 두고, 시각화
-   편의를 위한 `*_last` 컬럼에만 가장 최근 GPS 값을 그대로 이어붙인다(값 자체를
-   보간하지 않음 — 원본 그대로).
+   붙였다(⚠ 공식 스펙 아님). `x_raw/scale = x_g` 로 g 단위 값도 같이 산출해 저장한다.
+   **다만 두 필드의 의미는 아직 확정되지 않았다** — 아래 "알려진 한계" 참고. 특히
+   `count`를 "뒤에 오는 값 개수"로 적었던 예전 설명은 틀렸다(신규 Ambarella 샘플이
+   `gsensori,1,512,384,-35,-816` 처럼 count=1인데 뒤에 오는 값은 똑같이 4개다).
+   (Mercedes-Benz 샘플은 이 표준 gsensor 포맷을 안 써서 `sensor_values.csv` 자체가
+   안 생기고, 위 `vendor_raw`로만 보존된다.)
+7. `timeline.csv`: GPS(1Hz)와 표준 gsensor(있는 장비만, 예: INAVI 10Hz)를 sample 단위로
+   한 줄씩 합친 통합 타임라인 — GPRMC가 없는 sample은 `latitude`/`longitude` 등을
+   공란으로 두고, 시각화 편의를 위한 `*_last` 컬럼에만 가장 최근 GPS 값을 그대로
+   이어붙인다(값 자체를 보간하지 않음 — 원본 그대로). `vendor_raw`는 sample당 여러
+   건(예: Mercedes-Benz는 sample 1개당 ~21건)이라 timeline에는 안 합치고 별도
+   `vendor_raw.csv`로만 남긴다.
 
 ### 출력 폴더 구조
 
@@ -427,11 +540,18 @@ offset/size/시간을 다시 계산해야 하는 구조라 offset 계산 부분�
     │                              그 자체, "몇 번째 trak인지"가 아님)
     ├── index.csv                 Sample별 moof_index/traf_index/trun_index, offset/size,
     │                              dts/duration, start~end 시간, validation
-    ├── coordinates.csv/.txt      GPRMC/GPGGA 인식된 것만 (+ start/end 시간 컬럼 추가)
+    ├── coordinates.csv/.txt      GPRMC/GPGGA 인식된 것만. NMEA 필드 컬럼은 AVI 쪽
+    │                              (GPS_metadata_GPRMC.py)과 동일 — magvar/magvar_dir/
+    │                              mode/status_valid/parse_warnings 포함. AVI 고유 위치
+    │                              컬럼(sequence/idx1_entry_offset/chunk_id) 자리에는
+    │                              fMP4 고유의 sample/start_time_sec/end_time_sec이 들어감
     ├── sensor_values.csv         gsensor raw + g단위 환산값 (+ start/end 시간, ⚠ count/scale
-    │                              해석은 비공식 추정)
-    └── timeline.csv              GPS+G센서를 sample 시간 기준 한 줄로 합친 통합 타임라인
-                                   (신규, 시각화용)
+    │                              해석은 비공식 추정) — 표준 gsensor 포맷을 쓰는 장비만
+    │                              생성됨(rows 없으면 파일 자체가 안 생김)
+    ├── vendor_raw.csv            의미 미확인 `$TAG,...` 벤더 레코드 원본 그대로(태그/필드/
+    │                              raw, ⚠ 필드 해석 안 함) — 해당 포맷을 쓰는 장비만 생성됨
+    └── timeline.csv              GPS+표준gsensor를 sample 시간 기준 한 줄로 합친 통합
+                                   타임라인(시각화용, vendor_raw는 미포함)
 ```
 
 pvc1과 달리 `--extract`(Sample 원본 `.bin` 저장)와 `other_segments_unparsed.csv`/
@@ -484,11 +604,22 @@ CLI 옵션: `--list-tracks`(Track 목록만), `--dry-run`(파일 미생성, 콘�
 5. `avih`의 프레임 수(`dwTotalFrames`)도 실제로 남은 비디오 프레임(`00dc`/`01dc`/`00db`/
    `01db` chunk_id) 개수로 다시 세서 덮어씀 — 프레임 수 불일치로 인한 재생 오류 방지.
 6. 결과를 `Recovered_<원본파일명>`으로 저장(스트리밍 블록 복사, 큰 파일도 전체를 메모리에
-   올리지 않음). 실행하면 현재 폴더의 `REC_*.avi`를 모두 찾아 `./Recovered_2/`에 일괄
+   올리지 않음). `-i/--input-dir`, `-o/--output-dir`, `--pattern`으로 받아 폴더 일괄
    처리(`process_all_samples`, 이미 `Recovered_` 접두어인 파일은 재처리 스킵).
-7. 임베디드 RIFF를 하나도 못 찾으면(이미 깨끗한 파일이거나 이 스크립트가 다루는 손상
-   패턴이 아니면) 아무것도 만들지 않고 `False`를 반환 — 오탐 방지를 위해 "일단 잘라보고
-   보는" 동작은 하지 않는다.
+7. 임베디드 RIFF도 없고 최상위 RIFF도 1개뿐이면(이미 깨끗한 파일이거나 이 스크립트가
+   다루는 손상 패턴이 아니면) 아무것도 만들지 않고 `False`를 반환 — 오탐 방지를 위해
+   "일단 잘라보고 보는" 동작은 하지 않는다.
+
+> **고친 이력**: 위 3번의 "또는 최상위 RIFF 자체가 2개 이상"은 원래 이 문서에만 적혀
+> 있었고 코드에는 없었다 — `fix_blackbox_video`가 `_find_first_riff`로 맨 앞 RIFF 하나만
+> 읽고 트리거를 `if not embedded: return False`로 걸어둬서, 최상위 RIFF가 2개 이상
+> 이어붙은 형태(원래 슬랙 판단 기준으로 삼았던 바로 그 케이스)를 통째로 놓치고 있었다.
+> `_count_top_level_riffs()`를 추가해 `integration_avi.py`의 `need_repair = bool(embedded)
+> or top_count >= 2`와 기준을 일치시켰다. 같이 고친 것: 처리 대상이 `REC_*.avi`로 고정돼
+> EVT_ 등을 건너뛰던 문제(→ `--pattern`, 기본 `*.avi`), 입출력 경로 하드코딩(→ CLI 인자).
+> 실측 샘플 7개는 전부 최상위 RIFF가 1개(슬랙은 movi 내부 형태)라 이 경로를 타지 않으므로,
+> 원본을 두 번 이어붙인 합성 파일로 검증했다 — 수정 전엔 미검출, 수정 후엔 정상 절단되고
+> 복구본의 idx1 엔트리 수와 `coordinates.csv` 해시가 원본과 동일함을 확인.
 
 **실측 검증**: `REC_20240916_172436_F.avi`에서 임베디드 RIFF 2개(`0x4CC0000`, `0x4E60000`,
 각각 예전 파일 `REC_20240822_232548_R.avi`/`REC_20240908_064525_F.avi`의 JUNK 청크 파일명
@@ -518,6 +649,10 @@ GPS/센서 추출 결과는 리페어 전/후로 완전히 동일하다 — 이 
      데이터일 수 있는데 슬랙으로 오인해 지우는 사고를 막기 위함.
    - 리페어가 필요하면 결과 폴더 안에 `<파일명>_wo_slack.avi`를 생성(임시 폴더가 아니라
      최종 산출물로 바로 남김).
+   - `--dry-run`이면 이 단계도 판단 결과만 로그로 남기고 `_wo_slack.avi`/
+     `trailing_unknown_data.bin`을 **만들지 않는다**(출력 폴더 자체도 안 만듦). 리페어를
+     건너뛰고 원본으로 추출을 이어가는데, idx1이 애초에 현재 녹화분만 가리키므로 슬랙
+     유무는 추출 결과에 영향을 주지 않아 dry-run 요약 수치는 실제 실행과 동일하다.
 2. **추출** (`GPS_metadata_avi.py`와 동일 로직): 리페어된 파일이 있으면 그걸, 없으면 원본을
    그대로 읽어서 스트림 테이블 구성 → `SELECT_MODE` 기준 스트림 선택 → 각 idx1 엔트리
    payload를 내용 기반으로 4-way 분류 → 스트림 단위 80% 다수결로 text/float_vector 확정 →
@@ -556,13 +691,236 @@ CLI: `python integration_avi.py -o <출력루트> <입력1.avi> [<입력2.avi> .
 
 ---
 
+## integration_mp4.py — MP4 세 개를 합친 통합 스크립트
+
+`GPS_metadata_fragment_iso4_Atext.py` + `GPS_metadata_mp4_pvc1_Atext.py` +
+`GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py` 를 파일 하나로 합친 것. 여러 입력 파일을 한 번에
+받아 파일마다 구조를 판별하고 알맞은 경로로 보낸다.
+
+### 판별 (`probe_container`)
+
+브랜드가 아니라 **구조**로 분기한다. 실측 ftyp이 기대와 달랐기 때문이다 — 02번 INAVI Z300은
+`pvc1`이 아니라 `avc1`(영상 코덱 fourCC)이었고, 04번 Land Rover는 `mp42`, 03/05번은 둘 다
+`iso4`인데 그 `iso4`는 fragmented 전용 브랜드가 아니다. 즉 브랜드로는 02번을 못 찾고
+`iso4`만으로 fragmented를 단정할 수도 없다. brand/compatible_brands는 로그에만 남긴다.
+
+1. top-level Box를 순회해서 `moof` 개수, `moov` 유무, 각 `trak`의 `hdlr.handler_type`,
+   `moov/udta/mamt` 유무를 모은다.
+2. **`moof >= 1`** -> `ROUTE_FRAGMENTED`.
+3. `moof == 0` 이고 handler가 `text`/`sbtl`/`subt`인 trak이 있으면 -> `ROUTE_SAMPLETABLE`.
+4. `moof == 0` 이고 text trak이 없는데 `moov/udta/mamt`가 있으면 -> `ROUTE_UDTA_MAMT`.
+5. 셋 다 아니면 사유를 적어 SKIP(에러로 죽지 않음).
+
+**순서가 중요하다.** fragmented MP4도 moov 안에 초기화용 trak(내용 없는 stbl)을 갖고 있어서
+3번 조건에 같이 걸린다. 그래서 moof를 가장 먼저 본다 — 실제로 03/05번은 moof=60이면서
+동시에 text handler trak도 갖고 있어 이 순서가 없으면 잘못된 경로로 간다.
+
+### 루트별 처리
+
+세 `run_*` 함수는 각 원본 스크립트의 `main`이 하던 **호출 순서를 그대로** 따른다(파일 열기와
+CLI 처리만 디스패처가 대신함). 저수준 함수들은 원본에서 그대로 가져와 한 벌만 둔다.
+
+- `run_fragmented`: `scan_top_level` -> `parse_moov` -> moof마다 `parse_moof` ->
+  `save_outputs`. 시간축(tfdt+duration) 계산과 `timeline.csv`가 여기에만 있다.
+- `run_sampletable`: moov마다 trak을 `parse_track` -> `print_track_table` ->
+  text track마다 `extract_text_track` -> `save_track_summary`.
+- `run_udta_mamt`: `locate_gps_source`로 mamt를 찾고 payload에서 `$GxRMC` 문장을 잘라
+  `try_parse_rmc_sentence`로 파싱.
+
+### 합치면서 공통화한 것 (동작이 바뀌는 부분)
+
+- 세그먼트 분리/분류를 fragment 쪽 구현으로 통일했다. pvc1 원본은 `;`만 구분자로 썼고
+  `vendor_raw` 갈래 자체가 없었는데, 공통 구현은 `;`/CRLF/`$` 재분리를 하고 `$TAG,...`를
+  `vendor_raw`로 분류한다. 그래서 **루트 B에 `vendor_raw.csv`가 새로 생길 수 있다**. 02번
+  샘플은 `$` 시작 세그먼트가 없어 실제로는 안 생겼고, 기존 산출물은 전부 해시 동일했다.
+- gsensor 해석도 공통 구현을 쓴다. 루트 B의 `sensor_values.csv`는 기존 `field_0..N`을 유지한
+  채 `count/scale/x_raw/y_raw/z_raw/x_g/y_g/z_g`가 앞에 추가된 **상위호환**이 된다.
+  루트 A에는 원래 `count` 컬럼이 없었는데 이번에 추가해 두 루트를 맞췄다.
+- 그 외 좌표 CSV 컬럼과 파일 구성은 각 루트의 기존 산출물을 그대로 유지한다.
+
+### 검증 방법
+
+단독 3종을 같은 입력에 돌려 산출물을 **파일 단위 sha256으로 대조**했다(raw_chunks/*.bin
+180개 포함). 위에 적은 의도적 상위호환인 `sensor_values.csv` 하나만 다르고 나머지는 전부
+일치. 누락 검사는 원본 바이트에서 `$G?RMC`/`gsensor`를 전수 검색해 sample table 참조 범위와
+대조하는 방식으로 했다(아래 항목 참고).
+
+### 슬랙 카빙 (`run_slack_carve`, 기본 꺼짐 / `--slack`으로 켬)
+
+`--slack`을 줬을 때만 정상 경로가 끝난 뒤 `run_slack_carve`가 한 번 더 돈다.
+**기본을 꺼둔 이유**: 슬랙 레코드는 예전 녹화분이라 sample table이 없고, 따라서 지금 영상의
+재생 시각에 매핑할 수 없다(절대 byte offset만 남는다). 영상과 동기화한 시각화가 목적이면
+쓸 수 없는 데이터인데 스캔 비용은 크다(실측 2파일 0.36s -> 1.98s). 과거 주행 이력을 캐는
+포렌식 목적일 때만 켠다. 켜고 끄는 것이 정상 경로 산출물에는 영향이 없음을 바이트 단위로
+확인했다. `mp4_slack_carve.py`와 같은 로직을
+복사해 갖고 있고(공통 설계 원칙 참고 - import 아님), 원본은 수정하지 않고
+`<out_dir>/slack/`에만 결과를 남긴다. `--no-slack`으로 끌 수 있다.
+
+**영역 판정(`find_slack_regions`)**: Box size만 따라가며 최상위를 순회한 뒤,
+(1) `free`/`skip` Box payload, (2) Box 사이 gap, (3) 마지막 Box 뒤 꼬리를 슬랙으로 본다.
+문자열 검색을 쓰지 않는다. 순회 도중 size가 깨지면 거기서 멈추고 남은 뒷부분을 통째로
+`trailing`으로 잡는데, Land Rover 파일이 정확히 이 경우다(mdat 뒤 16.7MB).
+64바이트 미만 영역은 정렬용 `free`라 버린다.
+
+**카빙(`carve_region`)**: 슬랙엔 sample table이 없어 offset/size를 계산할 수 없다. 그래서
+`\$?[A-Z]{2}(RMC|GGA),[ -~]*` / `\$?gsensor[A-Za-z0-9]*,[ -~]*` 로 **시작점만** 찾고, 그
+매치 텍스트를 정상 경로와 같은 `split_segments` -> `classify_segment` 에 넘긴다. 매치의 첫
+세그먼트만 채택하고(뒤에 붙은 것들은 각자 자기 offset에서 따로 매치된다) 매치 위치가 곧
+절대 offset이 되므로 hex editor로 원본 대조가 된다. checksum 검증도 정상 경로와 동일하게
+하므로 우연히 생긴 바이트열은 대부분 걸러진다 - 실측 4종에서 checksum 실패 0건이었다.
+
+**실측 결과**
+
+| 폴더 | 영역 | 크기 | 카빙 |
+|---|---|---|---|
+| 02 Z300 | `free@0x19AB79C` | 2.4MB | GSENSOR 1 |
+| 03 QXD8000 | `free@0x4A61338` | 7.99MB | GPS 9 + GSENSOR 90 |
+| 04 Land Rover | `trailing@0x8618000` | 16.7MB | 0 |
+| 05 Mercedes | `free@0x113FAC99` | 56.6MB | GPS 5 |
+
+카빙된 GPS의 기록일이 전부 파일 자체 녹화일보다 과거였다(2024-03-12 파일 안에 2023-05-26
+좌표 등). 즉 같은 저장매체에 예전에 기록됐던 주행 이력이다. AVI의 movi 내부 슬랙과 같은
+현상(고정 크기 파일을 앞부분만 덮어쓰는 방식)이지만, MP4는 덮어쓰고 남은 뒷부분을 `free`
+Box로 "안 쓰는 영역"이라 선언해두는 점이 다르다.
+
+**AVI 쪽과의 차이**: `integration_avi.py`의 슬랙 처리는 *재생 가능한 깨끗한 사본을 만드는*
+리페어(`_wo_slack.avi` 생성)가 목적이고, MP4 쪽은 *잔재에서 데이터를 건져내는* 카빙이
+목적이다. MP4는 슬랙이 `free`로 명시돼 있어 정상 재생을 방해하지 않으므로 잘라낼 이유가 없다.
+
+### 알려진 한계
+
+- **gsensor g 환산은 미확정이고, 필드 의미 가설 두 개가 모두 반증됐다.**
+  `x_raw/scale`로 계산한 `|(x,y,z)|`의 중앙값은 정차/정속 주행이면 중력 때문에 ~1g여야
+  하는데 기기마다 다르게 나온다.
+
+  | 기기 | count | scale | `\|v\|/scale` | `\|v\|/scale*count` | 실측 1g 카운트 |
+  |---|---|---|---|---|---|
+  | 02 INAVI Z300 | 4 | 512 | 0.266g | 1.064g | ~136 |
+  | 03 INAVI QXD8000 | 4 | 2048 | 0.248g | 0.993g | ~508 |
+  | 신규 Ambarella(avc1/fMP4) | 1 | 512 | **1.99g** | **1.99g** | ~1010 |
+
+  - 가설 A "`scale` = 1g당 카운트"(현재 코드): 셋 다 1g가 안 나온다(0.27 / 0.25 / 1.99).
+  - 가설 B "`count` = ±Ng 풀스케일": INAVI 두 기기는 1g에 맞지만 신규 기기는 count=1이라
+    보정이 안 걸려 1.99g 그대로다. **기각.**
+  - `count`가 "뒤에 오는 값 개수"라는 해석도 반증됐다 — `gsensori,4,2048,500,-51,-51` 과
+    `gsensori,1,512,384,-35,-816` 은 둘 다 뒤에 값이 4개인데 count가 4와 1로 다르다.
+  - `scale` 필드와 실측 1g 카운트의 비율도 3.76 / 4.03 / 0.507 로 일관된 관계가 없다.
+
+  결론적으로 이 두 필드만으로 g를 유도하는 기기 공통 공식은 없다. 기존 `x_g`/`y_g`/`z_g`
+  컬럼은 호환을 위해 그대로 두되 **절대값을 신뢰하지 말 것**(축 방향과 상대적 변화 추이는
+  유효). 대신 아래 자가 보정 컬럼을 쓴다.
+
+### gsensor 자가 보정 (`apply_gsensor_calibration`)
+
+`scale` 필드 대신 **"1g에 해당하는 카운트"를 데이터 자체에서 역산**한다. 차에 고정된
+센서는 중력 1g를 항상 받고, 주행 가감속은 급브레이크도 0.3g 수준에 방향이 계속 바뀌므로,
+`|(x,y,z)|` 크기의 **중앙값을 1g로 본다**. 그 값으로 나눈 `x_g_cal`/`y_g_cal`/`z_g_cal` 과
+기준값 `calibration_counts_per_g` 를 CSV에 추가한다(기존 컬럼은 건드리지 않는 순수 추가).
+해석 가능한 레코드가 `MIN_CALIBRATION_SAMPLES`(30개) 미만이면 중앙값을 못 믿으므로 보정을
+생략하고 경고를 남긴다(Z300 슬랙이 1건이라 실제로 이 경로를 탄다).
+
+**이게 하드웨어 상수를 짚는다는 근거** — 같은 기기의 서로 다른 파일에서 같은 값이 나오고,
+심지어 **몇 달 전 다른 녹화분인 슬랙에서도 같은 값**이 나온다.
+
+| 파일 | 본체 counts/g | 슬랙 counts/g (과거 녹화분) |
+|---|---|---|
+| 신규 EVT_20260816_084706_F | 1023.1 | 1016.3 |
+| 신규 EVT_20260816_084706_R | 1024.2 | 1009.0 |
+| 신규 REC_20260816_085937_F | 1014.5 | 1018.7 |
+| 신규 REC_20260816_085937_R | 1016.7 | 1014.1 |
+| 신규 REC_20260816_102837_F | 1019.0 | 1014.1 |
+| 신규 REC_20260816_102837_R | 1019.0 | 1015.0 |
+| 03 INAVI QXD8000 | 508.5 | 503.5 |
+| 02 INAVI Z300 | 136.2 | (1건이라 보정 생략) |
+
+보정 후 축 분해도 물리적으로 맞다 — Z300/QXD8000은 `x_g_cal≈+0.97`로 x가 중력축(거의 수직
+장착), 신규 기기는 `z_g_cal≈-0.82, x_g_cal≈+0.37`로 갈리는데 `atan(0.373/0.818)≈24.5°`,
+앞유리 경사각과 일치한다. 보정 전에는 신규 기기가 `z_g=-1.635`(60초 내내 1.6g 가속 = 물리적
+불가능)로 나왔다.
+
+**한계**: 크기만 보정하고 장착 각도는 보정하지 않는다(중력이 여러 축에 갈린 채로 남으므로,
+"전후/좌우/상하" 차량 좌표계가 필요하면 회전 보정이 별도로 필요). 영상 전체가 급가속
+구간이면 중앙값 기준이 밀린다. 축별 영점 오프셋도 보지 않는다.
+
+**AVI 쪽은 해당 없음**: AVI의 `SENS` 스트림은 카운트가 아니라 float32 벡터로 이미 g 단위에
+가깝게 들어와(`|v|`가 1g 근처) 별도 보정을 붙이지 않았다.
+- `probe_container`와 각 루트가 top-level을 각각 순회해서 같은 경고가 warnings.log에 두 번
+  찍힐 수 있다(Land Rover 파일의 mdat 뒤 트레일링 바이트 경고). 표시상의 문제로 추출 결과에는
+  영향이 없다.
+
+## 재생 시간축 (네 경로 공통)
+
+영상 재생에 맞춰 시각화하려면 레코드마다 "영상 몇 초 지점인가"가 있어야 한다. 경로마다
+근거가 다르므로 `time_source` 컬럼에 어떤 방법으로 구한 값인지 남긴다.
+
+| 경로 | `time_source` | 구현 | 근거 |
+|---|---|---|---|
+| 루트 A | `tfdt_trun` | 기존 `parse_traf` | `tfdt.baseMediaDecodeTime` + `trun` duration 누적 ÷ `mdhd.timescale` |
+| 루트 B | `stts` | `parse_stts` / `build_sample_times` | `stts` (Decoding Time to Sample) ÷ `mdhd.timescale` |
+| 루트 C | `gps_utc_elapsed` | `assign_utc_elapsed_times` | sample table이 없어 GPS UTC 경과초 |
+| AVI | `avi_video_duration` | `compute_video_duration` / `build_avi_stream_times` | 영상 길이 ÷ 텍스트 스트림 레코드 수 |
+
+### 왜 외부 도구(ffprobe)를 안 쓰나
+
+ffprobe는 **컨테이너 총 길이만** 준다. "37번째 GPS 레코드가 몇 초 지점인가"는 안 알려주므로
+결국 여기서 하는 것과 같은 나눗셈/보간이 필요하다. 그리고 서드파티 디코더가 손상 구간을
+임의로 보정해버리면 이 프로젝트가 애써 잡아낸 이상(슬랙, 깨진 Box, Land Rover의 mdat 뒤
+16.7MB 트레일링)이 가려진다. 외부 바이너리 의존성도 늘어난다. 필요한 정보는 전부 파일 안에
+이미 있으므로 직접 읽는다.
+
+"총 길이만 받아서 1초씩 증가"시키는 방식도 쓰지 않는다. GPS는 1Hz라도 gsensor는
+10Hz(INAVI) / 30Hz(신규 Ambarella)라 균일 가정이 깨지고, Z300은 text track 자체가 0.1초
+간격이라 순번=초가 처음부터 성립하지 않는다.
+
+### AVI가 특수한 이유
+
+텍스트 스트림의 `strh`가 깨져 있는 기기가 많다.
+
+```
+VUGERA MB-900SB : txts dwScale=0,   dwRate=30   -> 0으로 나누기
+INAVI FXD900    : txts dwScale=100, dwRate=0    -> 0 Hz
+```
+
+반면 영상 스트림은 멀쩡하다(VUGERA 30.000fps x 1150프레임 = 38.3초, FXD900 29.970fps x
+1165프레임 = 38.9초). 그래서 `영상 길이 / 텍스트 스트림 레코드 수`로 간격을 낸다. VUGERA는
+txts dwLength가 영상 프레임 수와 같아 1/30초(프레임 동기), FXD900은 621 레코드라 1/16초가
+나온다. `compute_video_duration`은 영상 `strh`가 실패하면 `avih`(dwMicroSecPerFrame x
+dwTotalFrames)로 폴백한다.
+
+### 검증 - GPS UTC와의 독립 대조
+
+구조에서 뽑은 `start_time_sec`의 경과초와 GPS 문장의 UTC 경과초를 비교했다. `stts`(Z300)와
+`tfdt_trun`(신규 6개)은 중앙오차 0.000초, AVI는 0.03~0.27초였고 **누적 드리프트는 없다**
+(앞 1/4 평균 vs 뒤 1/4 평균 차이가 0.15초 미만). AVI의 잔여 오차는 초 단위 양자화다 -
+VUGERA는 1초에 GPS 레코드가 ~30개씩 같은 UTC 값을 공유하므로 그 안에서의 위치 차이다.
+
+QXD8000(+1.000초)과 Mercedes(-0.467초)만 어긋나는데, 추적해보면 **우리 축이 아니라 GPS
+수신이 튄 것**이다.
+
+```
+[QXD8000]  우리 간격: 1.0초 x 59 (완전 균일)   GPS UTC: 1.0초 x 58 + 0.0초 x 1
+[Mercedes] 우리 간격: 1.0초 x 59 (완전 균일)   GPS UTC: 0.0초 x 18 / 1.0초 x 24 / 2.0초 x 17
+```
+
+영상 동기화가 목적이면 균일한 구조 기반 축이 맞는 값이다. `gps_utc_elapsed`(루트 C)는 UTC로
+만든 값이라 UTC와의 대조가 자기검증이 되지 않으므로, 60초 영상에서 0.0~60.0초가 정확히
+나오는 것으로 확인했다.
+
+### timeline.csv
+
+네 경로 전부 같은 컬럼 구성으로 만든다(시각화 쪽이 경로마다 다른 파일을 읽지 않도록).
+GPS가 안 실린 sample은 좌표를 공란으로 두고 `*_last`에만 직전 값을 이어붙인다(보간 안 함).
+`x_g_cal` 계열은 센서 자가 보정이 끝난 뒤 sample 번호로 되짚어 채우므로 2-pass다.
+AVI는 GPS와 G센서가 서로 다른 스트림에 있어서 `write_avi_timeline`이 재생 시각으로 붙이고,
+AVI의 `SENS`는 이미 g 단위라 `*_g_cal`은 비워둔다.
+
 ## 공통 설계 원칙
 
 - **raw는 항상 그대로 보존**한다 — 디코딩 결과가 의심스러우면 `chunks/*.bin`,
   `*_concat.bin`(AVI), `chunks/*.bin`(MP4 pvc1, `--extract` 시)으로 원본 대조 가능. AVI의
   ID_MISMATCH/SIZE_MISMATCH 엔트리도 raw는 그대로 뽑되, false positive 방지를 위해
   자동 디코딩(분류/좌표 산출)만 생략하고 `index.csv`에 사유를 남긴다.
-  (예외: `GPS_metadata_fregment_iso4_Atext.py`는 raw `.bin` 저장 기능 자체가 없음 —
+  (예외: `GPS_metadata_fragment_iso4_Atext.py`는 raw `.bin` 저장 기능 자체가 없음 —
   GPS/속도/위치 시각화라는 목적에 필요 없어 의도적으로 뺀 것. 원본 대조가 필요하면
   `index.csv`의 `absolute_offset`/`size`로 원본 mp4를 직접 seek해서 확인하면 됨.)
 - **지원되는 NMEA 레코드의 값 변환 실패는 프로그램을 중단하지 않고 해당 레코드를 미분류/경고 처리한다** — `WARNINGS` 리스트에 쌓아서
