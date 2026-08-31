@@ -1,7 +1,7 @@
 # architect.md
 
 블랙박스 영상(AVI/MP4)에 박혀 있는 GPS/센서 메타데이터를 원본 그대로 카빙(carving)하고,
-알아볼 수 있는 패턴이면 자동으로 디코딩까지 하는 스크립트 7개에 대한 구조 설명.
+알아볼 수 있는 패턴이면 자동으로 디코딩까지 하는 스크립트 8개에 대한 구조 설명.
 언제 뭘 쓰는지는 README.md 참고, 여기는 "내부적으로 어떻게 정보를 찾고 파싱하는지"에 집중.
 
 ## 파일 구성과 관계
@@ -23,6 +23,10 @@ GPS_metadata_GPRMC.py
     ← GPS_metadata_avi.py를 import해서 재사용 (같은 폴더 필수)
 AVI_exception_lot_RIFF.py
     ← 파싱 전 전처리용 유틸 (손상된 AVI에서 슬랙 제거), 독립 실행 가능
+GPS_metadata_avi_txts_record72.py
+    ← txts/dats 스트림이 NMEA 텍스트가 아니라 72바이트 고정 이진 레코드인 경우 전용.
+      GPS_metadata_GPRMC.py 와 같이 `import GPS_metadata_avi as carve` 로 RIFF/idx1
+      저수준 파서를 그대로 쓰고, 이 파일은 레코드 해석만 갖는다.
 integration_avi.py
     ← 위 셋(avi/GPRMC/AVI_exception_lot_RIFF)의 기능을 한 파일로 합친 통합 스크립트.
       import는 안 하고 필요한 로직을 이 파일 안에 다시 구현/복사해뒀음(아래 참고).
@@ -632,10 +636,19 @@ GPS/센서 추출 결과는 리페어 전/후로 완전히 동일하다 — 이 
 
 ---
 
-## integration_avi.py — 위 세 개를 합친 통합 스크립트
+## integration_avi.py — 위 네 개를 합친 통합 스크립트
 
-`GPS_metadata_avi.py` + `GPS_metadata_GPRMC.py` + `AVI_exception_lot_RIFF.py`를 파일 하나로
-합친 것. 여러 입력 파일을 한 번에 받아 파일마다 아래 순서로 처리한다.
+`GPS_metadata_avi.py` + `GPS_metadata_GPRMC.py` + `AVI_exception_lot_RIFF.py` +
+`GPS_metadata_avi_txts_record72.py`를 파일 하나로 합친 것. 여러 입력 파일을 한 번에
+받아 파일마다 아래 순서로 처리한다.
+
+72바이트 레코드 해석은 `GPS_metadata_avi_txts_record72.py`의 코드 블록을 **그대로
+복사**해 갖고 있다(다른 통합 스크립트들과 같은 방식 — 한쪽을 고쳐도 다른 쪽은 안
+바뀌니 주의). 붙는 지점은 세 군데다: `classify_payload`에 `record72` 분기,
+`decide_stream_kind`에 `record72` 다수결, `write_decoded_outputs`에 `coordinates.*` +
+`sensor_values.csv` 출력. 경과 초는 파일 전체를 모은 뒤 한 번에 펴야 해서
+`extract_payload` 순회 중에는 `(seq, entry, record)`만 쌓아두고 순회가 끝난 뒤
+`finevu_unwrap_elapsed`로 처리한다.
 
 ### 처리 순서
 
@@ -647,6 +660,9 @@ GPS/센서 추출 결과는 리페어 전/후로 완전히 동일하다 — 이 
      수 MB짜리 완전 바이너리, NMEA 텍스트 패턴 없음) **절대 잘라내지 않고** 원본은 그대로
      둔 채 raw로 별도 보존(`trailing_unknown_data.bin` + 설명 `.README.txt`) — 실제
      데이터일 수 있는데 슬랙으로 오인해 지우는 사고를 막기 위함.
+     ※ 한동안 이 블록을 FineVu의 GPS 저장 위치로 의심했는데 아니었다. 그 계열의
+       GPS/충격센서는 movi 안 txts 스트림의 72바이트 레코드에 있고(위 record72 항목),
+       이 블록은 그것과 무관한 용도 미상 영역이다. 보존만 하는 정책은 그대로 둔다.
    - 리페어가 필요하면 결과 폴더 안에 `<파일명>_wo_slack.avi`를 생성(임시 폴더가 아니라
      최종 산출물로 바로 남김).
    - `--dry-run`이면 이 단계도 판단 결과만 로그로 남기고 `_wo_slack.avi`/
@@ -688,6 +704,92 @@ GPS/센서 추출 결과는 리페어 전/후로 완전히 동일하다 — 이 
 CLI: `python integration_avi.py -o <출력루트> <입력1.avi> [<입력2.avi> ...]` — 입력을 여러
 개 한 번에 받아 파일마다 위 과정을 순서대로 처리한다. `--select-mode`/`--fcctype`/
 `--index`/`--chunk-id`/`--dry-run`은 `GPS_metadata_avi.py`와 동일한 의미.
+
+---
+
+## GPS_metadata_avi_txts_record72.py — txts/dats의 72바이트 고정 이진 레코드 전용
+
+`GPS_metadata_GPRMC.py`와 같은 방식으로 `import GPS_metadata_avi as carve` 해서
+RIFF/idx1 저수준 파서(`validate_chunk`, `find_top_level_sections`, `parse_idx1`,
+`detect_base_offset`, `compute_video_duration` 등)를 그대로 쓴다. 자체 파서는 없고
+**레코드 해석만** 갖는다. 컨테이너에서 청크를 꺼내는 데까지는 AVI 쪽과 완전히 같은
+코드를 타므로, 슬랙/base offset/OpenDML 같은 이슈는 저쪽에서 이미 처리된 상태로 온다.
+
+### 왜 별도 경로가 필요한가
+
+`GPS_metadata_avi.py`의 `classify_payload`는 청크를 nmea_text / generic_text /
+float_vector / binary 넷으로 나눈다. 이 계열 레코드는 넷 중 어디에도 안 걸린다.
+
+- `looks_like_text_record`: 첫 바이트가 0x00이라 본문 길이 0 → 탈락
+- `try_float_vector`: 72바이트는 float 18개인데 상한이 8개라 → 탈락
+
+그래서 `binary`로 떨어지고 `decide_stream_kind`의 80% 다수결에서 아무 kind도 못
+받아 raw만 보존됐다. 데이터가 없었던 게 아니라 판정 규칙이 없었던 것이다. 이 스크립트가
+다섯 번째 분류(`record72`)를 추가한다.
+
+### 판정 방식 — 선두 서명을 안 쓰는 이유
+
+레코드 앞 40바이트는 뷰어가 읽지 않는 구간이라 기기마다 내용이 다르다. 어떤 모델은
+고정 서명 + 프레임 카운터를 넣고, X3000/X700 실측 샘플은 이 구간이 전부 0x00이다.
+그래서 선두 바이트로 판정하면 모델이 바뀔 때마다 깨진다. 대신 **값의 범위**로 본다.
+
+```
+길이 >= 69                       (경과 초 오프셋 68까지 있어야 완전한 레코드)
+충격센서 3축이 유한하고 |v| <= 100  (99.0/100.0 센티넬 포함)
+0 <= 속도 <= 400 km/h
+반구 플래그 >> 4 == 0             (2비트 필드 두 개라 상위 비트는 항상 0)
+측위된 레코드면 0 <= 위도 < 9000, 0 <= 경도 < 18000  (도분 기준)
+```
+
+이 조건을 앞쪽 8개 샘플 중 80% 이상이 통과해야 그 스트림을 채택한다
+(`GPS_metadata_avi.py`의 `DECODE_MIN_FRACTION`과 같은 기준).
+
+`float_vector`(최대 8개 = 32바이트)와 길이가 겹치지 않아서 분류 순서를 앞에 둬도
+기존 VUGERA SENS 판정을 가로채지 않는다 — 실측으로 AVI 샘플 7개 전부 대조해
+기존 5개의 결과가 컬럼 단위로 완전히 동일함을 확인했다.
+
+### 좌표 변환을 float32로 하는 이유
+
+도분 → 십진 도 변환식은 전 과정이 32비트 부동소수점 연산이다. 같은 식을 float64로
+계산하면 결과가 소수점 여섯째 자리에서 어긋난다(지상 거리로 약 0.2m). 그래서
+`_f32()`로 매 단계 반올림을 강제하고 캐스트 위치까지 그대로 옮겼다.
+
+```python
+v = _f32(value)
+q = _f32(v / 100.0)
+deg_i = int(q)                    # C의 (int) 캐스트 = 0 방향 절삭
+deg = _f32(float(deg_i))
+minutes = _f32((v - _f32(100 * deg_i)) / 60.0)
+return _f32(deg + minutes)
+```
+
+### txts와 dats
+
+둘은 필드 배치가 같은데 좌표 해석만 다르다. txts는 도분, dats는 이미 십진 도라
+변환을 걸면 안 된다. dats는 레코드 선두 7바이트가 `FF 01 00 00 0A 26 03`으로 정해져
+있어 그걸로 구분한다(txts에는 그런 검사가 없다). 스트림 fccType이 `dats`인 경우도
+같이 본다. dats 형식 실물 샘플은 아직 없어서 이 경로는 미검증이다.
+
+### 측위 실패 처리
+
+위경도가 둘 다 0.0이면 그 레코드는 측위 실패다. 좌표 0,0은 기니만 해상의 실제
+좌표라 값만으로는 구분되지 않으므로 좌표/속도를 **비워두고**(0으로 채우지 않고)
+`status=V`로 남긴다. `coordinates.txt`(좌표 목록)에서는 그 행이 빠지고
+`coordinates.csv`에는 그대로 남는다 — 다른 경로의 status=V 처리와 같은 규칙이다.
+
+충격센서 값 99.0(기록된 이상치)과 100.0(데이터 없음)은 실제 가속도가 아니라
+센티넬이라 결측으로 빼고 `parse_warnings`에 사유를 남긴다.
+
+### 경과 초와 절대 시각
+
+오프셋 68의 1바이트는 1초마다 1씩 증가하는 카운터다. 이걸 파일명 시각과 합치면
+레코드별 절대 시각이 나온다. 다만 0부터 시작하지 않는 자유 진행 카운터라(X3000
+실측 샘플은 86에서 시작) 그대로 더하면 86초가 밀린다. 그래서 첫 값과의 차이를 쓰고
+256에서 되돌아가는 것만 편다(`finevu_unwrap_elapsed`). 파일명에서 시각을 못 찾으면
+`abs_time`은 공란으로 두고 경고를 남긴다.
+
+이 값은 `start_time_sec`(영상 길이 / 레코드 수)과 독립적으로 구해지므로 서로
+교차검증이 된다 — X3000은 카운터 폭 60초, 영상 길이 60.002초로 일치한다.
 
 ---
 

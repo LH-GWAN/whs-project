@@ -10,8 +10,9 @@
 
   ```
   integration_blackbox.py                  <- 컨테이너 판별
-  ├── integration_avi.py                   <- AVI 3종 통합
-  │     GPS_metadata_avi.py / GPS_metadata_GPRMC.py / AVI_exception_lot_RIFF.py
+  ├── integration_avi.py                   <- AVI 4종 통합
+  │     GPS_metadata_avi.py / GPS_metadata_GPRMC.py / AVI_exception_lot_RIFF.py /
+  │     GPS_metadata_avi_txts_record72.py
   └── integration_mp4.py                   <- MP4 3종 + 슬랙 카빙 통합
         GPS_metadata_fragment_iso4_Atext.py / GPS_metadata_mp4_pvc1_Atext.py /
         GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py / mp4_slack_carve.py
@@ -65,6 +66,9 @@
     → **GPS_metadata_mp4_udta_mamt_GNRMC_pmp42.py**
   - Fragmented MP4(moov 대신 moof/mdat이 반복), INAVI QXD8000/Mercedes-Benz Drive View 등
     → **GPS_metadata_fragment_iso4_Atext.py**
+- AVI인데 txts 스트림 내용이 NMEA 텍스트가 아니라 72바이트 고정 이진 레코드인 경우
+  (FineVu X3000/X700 등) → **GPS_metadata_avi_txts_record72.py**
+  (integration_avi.py가 내용을 보고 자동으로 이 경로를 타므로 보통은 불필요)
 - MP4에서 이전 녹화 잔재(free Box/파일 꼬리)에 남은 과거 GPS만 따로 건지고 싶으면
   → **mp4_slack_carve.py** (integration_mp4.py가 기본으로 같이 수행하므로 보통은 불필요)
 
@@ -104,9 +108,10 @@ GPS_Sample_avi/
 │   └── warnings.log
 ├── EVT_2025_10_12_02_01_59_S/        ← INAVI, strl에 이름 없이 txts만, 슬랙 없음
 │   └── TXTS/chunks/*.bin, coordinates.csv/.txt, unparsed_lines.txt, ...
-└── 20241024-11h11m18s_N/             ← FineVu X3000 CustomGPS, movi 안 TEXT 스트림은 빈 더미
-    ├── TEXT/chunks/*.bin (전부 0바이트 패턴, 디코딩 안 됨)
+└── 20241024-11h11m18s_N/             ← FineVu X3000 CustomGPS, txts에 72바이트 이진 레코드
+    ├── TEXT/chunks/*.bin, coordinates.csv/.txt, sensor_values.csv, timeline.csv
     └── trailing_unknown_data.bin(+.README.txt)  ← RIFF 끝 뒤 23MB 커스텀 바이너리, 원본 보존만
+                                                   (GPS와는 무관한 별개 영역)
 ```
 
 CLI 옵션은 `GPS_metadata_avi.py`와 동일: `--select-mode`(`auto_non_av`/`by_fcctype`/
@@ -116,9 +121,14 @@ CLI 옵션은 `GPS_metadata_avi.py`와 동일: `--select-mode`(`auto_non_av`/`by
 (`_wo_slack.avi`)과 `trailing_unknown_data.bin`도 마찬가지로 안 만들고, 원본 그대로
 추출을 진행한다(idx1은 현재 녹화분만 가리키므로 슬랙 유무는 GPS 추출 결과에 영향 없음).
 
-⚠ FineVu "CustomGPS" 두 샘플(X3000/X700)은 GPS 데이터가 AVI 스트림 안에 없고 RIFF 뒤에
-붙는 벤더 자체 바이너리 포맷 안에 있는 것으로 보임 — NMEA 텍스트가 아니라서 이 스크립트로는
-내용을 해독하지 못했고, 원본 그대로 raw로만 잘라 보존해뒀다(위 `trailing_unknown_data.bin`).
+FineVu "CustomGPS" 두 샘플(X3000/X700)은 txts 스트림에 NMEA 텍스트가 아니라 72바이트
+고정 이진 레코드가 들어 있다. 앞 40바이트가 전부 0x00이라 예전에는 스트림 전체가
+`BINARY/미상`으로 빠져 raw만 남았는데, 지금은 `record72` 경로로 자동 디코딩된다
+(X3000 1,035개 / X700 1,060개 전부 측위 성공, 결과는 `GPS_Sample_7` / `GPS_Sample_8`).
+형식 근거는 `GPS_metadata_avi_txts_record72.py` 항목 참고.
+
+한동안 RIFF 뒤 `JUNK` 트레일링 블록(X3000 23MB, X700 7.4MB)을 GPS 저장 위치로 의심했는데
+아니었다. 그쪽은 여전히 용도 미상이고 `trailing_unknown_data.bin`으로 보존만 한다.
 
 # AVI_exception_lot_RIFF.py
 
@@ -242,6 +252,77 @@ GPS_Sample_6/
     ├── raw_chunks/*.bin     ← 621개 레코드 각각 원본 그대로 (112바이트)
     └── raw_concat.bin       ← 위 621개를 이어붙인 것 (원본 payload 그대로)
 ```
+
+# GPS_metadata_avi_txts_record72.py — txts가 텍스트가 아니라 72바이트 이진 레코드일 때
+
+`GPS_metadata_avi.py`는 txts 스트림을 NMEA 텍스트로 보고 디코딩한다. 그런데 같은 txts
+스트림에 텍스트가 아니라 **72바이트 고정 이진 레코드**를 넣는 계열이 있다(FineVu
+X3000/X700 등). 그 파일은 `GPS_metadata_avi.py`로 돌리면 스트림 전체가 `BINARY/미상`으로
+빠져 raw만 남는다 — 이 스크립트가 그 raw를 해석한다.
+
+```
+python GPS_metadata_avi_txts_record72.py 입력.avi 출력디렉터리
+```
+
+RIFF/idx1 저수준 파싱은 `import GPS_metadata_avi as carve`로 그대로 쓰고
+(`GPS_metadata_GPRMC.py`와 같은 방식이라 두 파일은 같은 폴더에 있어야 한다),
+이 파일은 레코드 해석만 갖는다. `integration_avi.py`에는 같은 해석 로직이
+복사돼 들어가 있어서 실무에서는 보통 그쪽만 쓰면 된다.
+
+## 레코드 배치 (리틀엔디언, 청크 데이터 선두를 오프셋 0으로)
+
+| 오프셋 | 크기 | 형 | 필드 |
+|---|---|---|---|
+| 0~39 | 40 | — | 미해석. 뷰어가 읽지 않는 구간이라 기기마다 다름 |
+| 40 / 44 / 48 | 4씩 | float32 | 충격센서 X / Y / Z (g) |
+| 52 | 4 | uint32 | 반구 플래그. `v & 3 == 1`이면 북위, `(v >> 2) & 3 == 1`이면 동경 |
+| 56 | 4 | float32 | 속도 (km/h, 환산 불필요) |
+| 60 | 4 | float32 | 위도 (txts는 `DDMM.MMMM` 도분, dats는 십진 도) |
+| 64 | 4 | float32 | 경도 (txts는 `DDDMM.MMMM` 도분, dats는 십진 도) |
+| 68 | 1 | uint8 | 경과 초 (1초마다 +1) |
+| 69~71 | 3 | — | 미해석 |
+
+주의할 점 셋.
+
+1. **위경도가 둘 다 0.0이면 측위 실패**다. 좌표 0,0은 기니만 해상의 실제 좌표라 값만
+   보고는 구분되지 않으므로 반드시 결측으로 처리한다. 여기서는 좌표/속도 칸을 비우고
+   `status=V`로 남긴다(`coordinates.txt`에서는 그 행이 빠지고 CSV에는 남는다).
+2. **도분→십진 변환은 float32로 해야 한다.** 같은 식을 float64로 계산하면 소수점
+   여섯째 자리에서 어긋난다(지상 거리로 약 0.2m). 나눗셈과 캐스트 위치까지 그대로
+   재현해뒀다.
+3. **txts와 dats는 필드 배치가 같은데 좌표 해석만 다르다.** dats는 이미 십진 도라
+   도분 변환을 걸면 안 된다. dats는 선두 7바이트 매직(`FF 01 00 00 0A 26 03`)으로
+   구분한다.
+
+앞 40바이트를 시그니처로 삼지 않는다 — 기기에 따라 값이 다르다(어떤 모델은 고정
+서명 + 프레임 카운터가 들어가고, X3000/X700 실측 샘플은 이 구간이 전부 0x00이다).
+대신 속도/좌표/센서 값의 범위와 반구 플래그 상위 비트로 형식을 판정하고, 앞쪽 8개
+샘플 중 80% 이상이 통과해야 그 스트림을 레코드 스트림으로 채택한다.
+
+## 출력
+
+```
+출력디렉터리/
+├── <스트림라벨>/
+│   ├── chunks/*.bin, <prefix>_concat.bin   ← raw 그대로
+│   ├── coordinates.csv                     ← 레코드 전체(측위 실패 행 포함)
+│   ├── coordinates.txt                     ← 좌표 목록(측위 성공 행만)
+│   └── sensor_values.csv                   ← 충격센서 3축
+├── timeline.csv                            ← 시각화용 통합 타임라인
+├── index.csv, stream_table.csv, record_detection.csv, warnings.log
+```
+
+`coordinates.csv`에는 `elapsed_sec`(원본 1바이트 카운터)와 `elapsed_delta_sec`,
+`abs_time`이 함께 들어간다. 뷰어는 날짜/시각을 파일명에서 가져오고 이 카운터를
+읽지 않는데, 파일명 시각 + 경과 초를 합치면 레코드별 절대 시각이 나온다(뷰어가
+제공하지 않는 정보). 다만 이 카운터는 0부터 시작하지 않는 자유 진행 카운터라
+(X3000 실측 샘플은 86에서 시작) 첫 값과의 차이를 쓰고 256에서 되돌아가는 것만 편다.
+`raw_record_hex`에 72바이트 원본을 그대로 남겨서 해석이 의심되면 대조할 수 있다.
+
+**실측**: X3000 1,035 레코드 / X700 1,060 레코드 전부 해석 + 측위 성공.
+결과는 `GPS_Sample_7` / `GPS_Sample_8`. X3000 좌표 범위(37.4366~37.4419,
+126.8998~126.9002)에 제조사 공식 뷰어가 화면에 띄운 좌표(37.438652, 126.900215)가
+들어간다. 절대 시각 폭(60초)도 영상 길이(60.002초)와 맞는다.
 
 # integration_mp4.py — MP4는 이거 하나로
 

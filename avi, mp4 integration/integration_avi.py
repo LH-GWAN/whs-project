@@ -2,6 +2,7 @@
 # ---- GPS_metadata_GPRMC.py 의 텍스트 스트림 사전 판정은 decide_stream_kind 다수결로 흡수됨 ----
 import argparse
 import csv
+import datetime
 import math
 import mmap
 import os
@@ -573,12 +574,17 @@ def try_float_vector(payload):
     return vals
 
 
-def classify_payload(payload):
+def classify_payload(payload, stream_fcc=None):
     nmea_line = find_embedded_nmea_text(payload)
     if nmea_line:
         return "nmea_text", nmea_line
     if looks_like_text_record(payload):
         return "generic_text", decode_text_record(payload)
+    # 72바이트 고정 레코드는 앞 40바이트가 0x00이라 텍스트/float 벡터 판정에 안 걸린다.
+    # float_vector(최대 8개=32바이트)와 길이가 겹치지 않아 순서를 앞에 둬도 안전하다.
+    record = parse_finevu_record(payload, stream_fcc)
+    if record is not None:
+        return "record72", record
     fvec = try_float_vector(payload)
     if fvec is not None:
         return "float_vector", fvec
@@ -759,6 +765,223 @@ def try_parse_nmea(line):
 
 
 # ---------------------------------------------------------------------------
+# FineVu txts/dats 72바이트 고정 레코드 (FineVu Player 2.0 역분석 결과 기반)
+#
+# 같은 txts 스트림을 쓰면서도 NMEA 텍스트가 아니라 72바이트 고정 이진 레코드를 넣는
+# 계열이 있다(FineVu X3000/X700 등). 앞 40바이트가 전부 0x00이라 텍스트 판정에도
+# float 벡터 판정에도 안 걸려서, 예전에는 이 스트림이 통째로 BINARY/미상으로 빠지고
+# raw만 보존됐다. 데이터가 없었던 게 아니라 디코딩 규칙이 없었던 것.
+#
+# 레코드 배치 (리틀엔디언, 청크 데이터 선두를 오프셋 0으로 봄)
+#     0~39      미해석. 뷰어가 읽지 않는 구간이라 기기마다 내용이 다르다.
+#               (LX2000은 선두 7바이트가 20 00 00 00 20 33 00 고정 + 8번째가 프레임
+#                카운터. X3000/X700 실측 샘플은 이 구간이 전부 0x00 - 그래서 이 값을
+#                시그니처로 삼으면 안 된다.)
+#     40/44/48  float32  충격센서 X/Y/Z (단위 g)
+#     52        uint32   반구 플래그. (v & 3) == 1 이면 북위 아니면 남위,
+#                        ((v >> 2) & 3) == 1 이면 동경 아니면 서경
+#     56        float32  속도 (km/h - 별도 환산 불필요)
+#     60        float32  위도  txts=DDMM.MMMM 도분 / dats=십진 도
+#     64        float32  경도  txts=DDDMM.MMMM 도분 / dats=십진 도
+#     68        uint8    경과 초 (1초마다 +1). 뷰어는 안 읽지만 우리는 쓴다.
+#     69~71     미해석
+#
+# 주의할 점 세 가지.
+#  1) 위경도가 둘 다 0.0이면 그 레코드는 측위 실패다. 좌표 0,0은 기니만 해상의 실제
+#     좌표라 값만 보고는 구분이 안 되므로 반드시 결측으로 처리한다(뷰어도 txts 경로는
+#     NaN을 채운다). 여기서는 좌표/속도 칸을 비우고 status=V로 남긴다.
+#  2) txts와 dats는 필드 배치가 같은데 좌표 해석만 다르다. dats는 이미 십진 도라
+#     도분 변환을 걸면 안 된다. dats는 선두 7바이트 매직으로 구분된다.
+#  3) 도분->십진 변환은 반드시 float32로 해야 한다. 같은 식을 float64로 계산하면
+#     소수점 여섯째 자리에서 어긋난다(지상 거리로 약 0.2m).
+# ---------------------------------------------------------------------------
+
+FINEVU_OFF_GX = 40
+FINEVU_OFF_GY = 44
+FINEVU_OFF_GZ = 48
+FINEVU_OFF_HEMI = 52
+FINEVU_OFF_SPEED = 56
+FINEVU_OFF_LAT = 60
+FINEVU_OFF_LON = 64
+FINEVU_OFF_ELAPSED = 68
+FINEVU_RECORD_LEN = 72
+
+# 뷰어가 실제로 건드리는 최대 오프셋이 67이라 68바이트면 좌표까지는 읽을 수 있다.
+# 경과 초(68)까지 있어야 완전한 레코드로 본다.
+FINEVU_RECORD_MIN_LEN = 69
+
+# dats 스트림 레코드의 선두 매직 (뷰어 코드 안에 상수로 박혀 있고, 뷰어는 dats에
+# 대해서만 이 값을 검사해 일치하는 레코드만 처리한다. txts에는 검사가 없다.)
+FINEVU_DATS_MAGIC = b"\xff\x01\x00\x00\x0a\x26\x03"
+
+# 오탐 방지용 범위. 랜덤 바이트가 우연히 이 조건을 다 통과하기는 어렵다.
+FINEVU_MAX_SPEED_KMH = 400.0
+FINEVU_MAX_G = 100.0          # 99.0(기록된 이상치)/100.0(데이터 없음) 센티넬 포함
+FINEVU_G_SENTINELS = (99.0, 100.0)
+FINEVU_MAX_LAT_DM = 9000.0    # 90도 00.0000분
+FINEVU_MAX_LON_DM = 18000.0   # 180도 00.0000분
+FINEVU_ELAPSED_WRAP = 256     # 경과 초가 1바이트라 256에서 되돌아간다
+
+# 파일명에서 녹화 시작 시각을 뽑는 패턴. 기기마다 구분자가 달라서 몇 가지를 본다.
+#   20241024-11h11m18s_N / 20260812-10h55m02s_N   (FineVu)
+#   EVT_20240618_184124_F / REC_20240916_172436_F (VUGERA)
+#   EVT_2025_10_12_02_01_59_S                     (INAVI)
+FINEVU_FILENAME_TS_RES = [
+    re.compile(r"(\d{4})(\d{2})(\d{2})[-_ ]?(\d{2})h(\d{2})m(\d{2})s"),
+    re.compile(r"(\d{4})(\d{2})(\d{2})[-_ ](\d{2})(\d{2})(\d{2})"),
+    re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})"),
+]
+
+
+def _f32(x):
+    """double -> float32 반올림. 뷰어의 float 연산을 그대로 재현하기 위한 것."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def finevu_dm_to_decimal(value):
+    """DDMM.MMMM 도분 -> 십진 도. 뷰어의 변환 함수를 연산 순서까지 그대로 옮겼다.
+
+        return (float)(int)(float)(v / 100.0)
+             + (float)((v - (float)(100 * (int)(float)(v / 100.0))) / 60.0);
+
+    나눗셈과 캐스트 위치를 바꾸거나 전 과정을 float64로 계산하면 뷰어와 값이
+    소수점 여섯째 자리에서 어긋난다."""
+    v = _f32(value)
+    q = _f32(v / 100.0)
+    deg_i = int(q)                      # C의 (int) 캐스트 = 0 방향 절삭
+    deg = _f32(float(deg_i))
+    minutes = _f32((v - _f32(100 * deg_i)) / 60.0)
+    return _f32(deg + minutes)
+
+
+def finevu_is_dats_record(payload, stream_fcc=None):
+    """이 레코드의 좌표가 십진 도(dats)인지 도분(txts)인지 판단한다."""
+    if payload[:len(FINEVU_DATS_MAGIC)] == FINEVU_DATS_MAGIC:
+        return True
+    return stream_fcc == b"dats"
+
+
+def parse_finevu_record(payload, stream_fcc=None):
+    """72바이트 고정 레코드를 해석한다. 형식이 아니면 None.
+
+    반환 dict의 lat/lon/speed_kmh는 측위 실패 시 None이다. 0으로 채우지 않는다."""
+    if len(payload) < FINEVU_RECORD_MIN_LEN:
+        return None
+
+    try:
+        gx, gy, gz, hemi, speed, lat_raw, lon_raw = struct.unpack_from(
+            "<fffIfff", payload, FINEVU_OFF_GX)
+    except struct.error:
+        return None
+    elapsed = payload[FINEVU_OFF_ELAPSED]
+
+    for v in (gx, gy, gz, speed, lat_raw, lon_raw):
+        if not math.isfinite(v):
+            return None
+    if any(abs(v) > FINEVU_MAX_G for v in (gx, gy, gz)):
+        return None
+    if not (0.0 <= speed <= FINEVU_MAX_SPEED_KMH):
+        return None
+    # 반구 플래그는 2비트짜리 두 개라 상위 비트가 켜져 있으면 이 형식이 아니다.
+    if hemi >> 4:
+        return None
+
+    decimal_coords = finevu_is_dats_record(payload, stream_fcc)
+    no_fix = (lat_raw == 0.0 and lon_raw == 0.0)
+
+    parse_warnings = []
+    lat = lon = None
+    speed_kmh = None
+
+    if not no_fix:
+        if decimal_coords:
+            if not (abs(lat_raw) <= 90.0 and abs(lon_raw) <= 180.0):
+                return None
+            lat, lon = _f32(lat_raw), _f32(lon_raw)
+        else:
+            if not (0.0 <= lat_raw < FINEVU_MAX_LAT_DM
+                    and 0.0 <= lon_raw < FINEVU_MAX_LON_DM):
+                return None
+            lat = finevu_dm_to_decimal(lat_raw)
+            lon = finevu_dm_to_decimal(lon_raw)
+        # 뷰어는 1이 아니면 전부 남위/서경으로 본다. 0이나 3처럼 뷰어도 정의하지
+        # 않은 값이 오면 부호는 뷰어와 똑같이 처리하되 경고를 남긴다.
+        lat_flag, lon_flag = hemi & 3, (hemi >> 2) & 3
+        if lat_flag not in (1, 2) or lon_flag not in (1, 2):
+            parse_warnings.append("unexpected_hemisphere_flag")
+        if lat_flag != 1:
+            lat = -lat
+        if lon_flag != 1:
+            lon = -lon
+        speed_kmh = speed
+
+    gvals = []
+    for v in (gx, gy, gz):
+        if any(abs(v - s) < 1e-6 for s in FINEVU_G_SENTINELS):
+            # 99.0 = 기록된 이상치, 100.0 = 데이터 없음. 실제 가속도로 쓰면 그래프가
+            # 크게 왜곡되므로 둘 다 결측으로 뺀다.
+            gvals.append(None)
+            parse_warnings.append("gsensor_sentinel")
+        else:
+            gvals.append(v)
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "status": "A" if not no_fix else "V",
+        "status_valid": not no_fix,
+        "speed_kmh": speed_kmh,
+        "track_deg": "",          # txts/dats 경로는 진행 방향을 채우지 않는다
+        "x_g": gvals[0], "y_g": gvals[1], "z_g": gvals[2],
+        "hemi_flag": hemi,
+        "lat_raw": lat_raw, "lon_raw": lon_raw,
+        "coord_format": "decimal(dats)" if decimal_coords else "ddmm(txts)",
+        "elapsed_sec": elapsed,
+        "parse_warnings": ";".join(sorted(set(parse_warnings))),
+        "trusted": bool(not no_fix and not parse_warnings),
+        "raw": payload[:FINEVU_RECORD_LEN].hex(),
+    }
+
+
+def finevu_filename_start_time(path):
+    """파일명에 박힌 녹화 시작 시각을 datetime으로. 못 찾으면 None."""
+    stem = os.path.basename(path)
+    for rx in FINEVU_FILENAME_TS_RES:
+        m = rx.search(stem)
+        if not m:
+            continue
+        try:
+            return datetime.datetime(*(int(g) for g in m.groups()))
+        except ValueError:
+            continue
+    return None
+
+
+def finevu_unwrap_elapsed(values):
+    """1바이트 경과 초를 단조 증가하는 초로 편다.
+
+    보고서는 '파일명 시각 + 경과 초'라고 적었지만, 실측 X3000 샘플은 첫 레코드가
+    86에서 시작한다(자유 진행 카운터). 그대로 더하면 86초가 밀리므로 첫 값과의
+    차이를 쓰고, 256에서 되돌아가는 것만 펴 준다."""
+    out = []
+    base = None
+    prev = None
+    carry = 0
+    for v in values:
+        if v is None:
+            out.append(None)
+            continue
+        if base is None:
+            base = v
+            prev = v
+        if v < prev:
+            carry += FINEVU_ELAPSED_WRAP
+        prev = v
+        out.append(v + carry - base)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 재생 시간축 (AVI)
 #
 # AVI의 텍스트 스트림은 strh의 dwScale/dwRate가 깨져 있는 기기가 많다. 실측:
@@ -805,7 +1028,7 @@ def build_avi_stream_times(video_duration, record_count):
     return [(i * step, (i + 1) * step) for i in range(record_count)]
 
 def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
-                     dry_run=False, stream_times=None):
+                     dry_run=False, stream_times=None, start_dt=None):
     chunk_id_to_stream = {}
     for s in selected_streams:
         for cid in s.observed_chunk_ids:
@@ -821,11 +1044,16 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
     chunks_per_stream = {s.index: 0 for s in selected_streams}
     preview_printed = {s.index: 0 for s in selected_streams}
 
-    classify_counts = {s.index: {"nmea_text": 0, "generic_text": 0, "float_vector": 0, "binary": 0}
+    classify_counts = {s.index: {"nmea_text": 0, "generic_text": 0, "record72": 0,
+                                  "float_vector": 0, "binary": 0}
                         for s in selected_streams}
     coord_rows_by_stream = {s.index: [] for s in selected_streams}
     unparsed_by_stream = {s.index: [] for s in selected_streams}
     sensor_rows_by_stream = {s.index: [] for s in selected_streams}
+    # 72바이트 레코드는 경과 초(offset 68)가 1바이트 자유 진행 카운터라 파일 전체를
+    # 모은 뒤 한 번에 펴야 한다. 그래서 여기서는 (seq, entry, record)만 쌓아두고
+    # coord/sensor 행은 순회가 끝난 뒤에 만든다.
+    record72_by_stream = {s.index: [] for s in selected_streams}
 
     if not dry_run:
         os.makedirs(out_dir, exist_ok=True)
@@ -889,7 +1117,7 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                      f"validation={status} - raw는 보존하지만 신뢰할 수 없어 자동 디코딩은 생략, "
                      f"chunk_offset=0x{chunk_offset:X}")
             else:
-                kind, value = classify_payload(payload)
+                kind, value = classify_payload(payload, stream.fcc_type)
                 classify_counts[stream.index][kind] += 1
                 if kind in ("nmea_text", "generic_text"):
                     parsed = try_parse_nmea(value)
@@ -922,6 +1150,9 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                         })
                     elif value:
                         unparsed_by_stream[stream.index].append((seq, value))
+                elif kind == "record72":
+                    record72_by_stream[stream.index].append((seq, e, value,
+                                                              start_disp, end_disp, time_source))
                 elif kind == "float_vector":
                     row = {
                         "start_time_sec": start_disp,
@@ -962,6 +1193,54 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
 
     for fh in file_handles.values():
         fh.close()
+
+    # 72바이트 레코드 후처리: 경과 초를 편 뒤 coord/sensor 행을 만든다.
+    # GPS와 충격센서가 한 레코드에 같이 들어 있어서 양쪽에 같은 seq로 넣는다
+    # (timeline이 start_time_sec로 둘을 붙이므로 그대로 한 줄이 된다).
+    for sidx, items in record72_by_stream.items():
+        deltas = finevu_unwrap_elapsed([rec["elapsed_sec"] for _, _, rec, _, _, _ in items])
+        for (seq, e, rec, start_disp, end_disp, time_source), delta in zip(items, deltas):
+            abs_time = ""
+            if start_dt is not None and delta is not None:
+                abs_time = (start_dt + datetime.timedelta(seconds=delta)).strftime(
+                    "%Y-%m-%d %H:%M:%S")
+            chunk_id_txt = e["chunk_id"].decode("ascii", errors="replace")
+            fmt = lambda v, spec="{:.6f}": "" if v is None else spec.format(v)
+            coord_rows_by_stream[sidx].append({
+                "start_time_sec": start_disp,
+                "end_time_sec": end_disp,
+                "time_source": time_source,
+                "elapsed_sec": rec["elapsed_sec"],
+                "elapsed_delta_sec": "" if delta is None else delta,
+                "abs_time": abs_time,
+                "status": rec["status"],
+                "latitude": fmt(rec["lat"]),
+                "longitude": fmt(rec["lon"]),
+                "speed_kmh": fmt(rec["speed_kmh"], "{:.3f}"),
+                "track_deg": rec["track_deg"],
+                "x_g": fmt(rec["x_g"]), "y_g": fmt(rec["y_g"]), "z_g": fmt(rec["z_g"]),
+                "hemi_flag": rec["hemi_flag"],
+                "lat_raw": f"{rec['lat_raw']:.4f}",
+                "lon_raw": f"{rec['lon_raw']:.4f}",
+                "coord_format": rec["coord_format"],
+                "status_valid": rec["status_valid"],
+                "trusted": rec["trusted"],
+                "parse_warnings": rec["parse_warnings"],
+                "sequence": seq,
+                "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
+                "chunk_id": chunk_id_txt,
+                "raw_record_hex": rec["raw"],
+            })
+            sensor_rows_by_stream[sidx].append({
+                "start_time_sec": start_disp,
+                "end_time_sec": end_disp,
+                "time_source": time_source,
+                "sequence": seq,
+                "idx1_entry_offset": f"0x{e['idx_offset']:08X}",
+                "chunk_id": chunk_id_txt,
+                "vector_length": 3,
+                "x": fmt(rec["x_g"]), "y": fmt(rec["y_g"]), "z": fmt(rec["z_g"]),
+            })
 
     return {
         "index_rows": index_rows,
@@ -1021,9 +1300,12 @@ def decide_stream_kind(counts, min_fraction=DECODE_MIN_FRACTION):
     if total == 0:
         return None
     text_ratio = (counts["nmea_text"] + counts["generic_text"]) / total
+    record72_ratio = counts.get("record72", 0) / total
     float_ratio = counts["float_vector"] / total
     if text_ratio >= min_fraction:
         return "text"
+    if record72_ratio >= min_fraction:
+        return "record72"
     if float_ratio >= min_fraction:
         return "float_vector"
     return None
@@ -1071,6 +1353,7 @@ def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_ru
             "start_time_sec": r.get("start_time_sec", ""),
             "end_time_sec": r.get("end_time_sec", ""),
             "time_source": r.get("time_source", ""),
+            "abs_time": r.get("abs_time", ""),
             "latitude": r.get("latitude", ""),
             "longitude": r.get("longitude", ""),
             "speed_kmh": r.get("speed_kmh", ""),
@@ -1091,6 +1374,22 @@ def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_ru
         w.writeheader()
         w.writerows(rows)
     return len(rows)
+
+RECORD72_COORD_FIELDS = [
+    "start_time_sec", "end_time_sec", "time_source",
+    "elapsed_sec", "elapsed_delta_sec", "abs_time",
+    "status", "latitude", "longitude", "speed_kmh", "track_deg",
+    "x_g", "y_g", "z_g",
+    "hemi_flag", "lat_raw", "lon_raw", "coord_format",
+    "status_valid", "trusted", "parse_warnings",
+    "sequence", "idx1_entry_offset", "chunk_id", "raw_record_hex",
+]
+
+RECORD72_SENSOR_FIELDS = [
+    "start_time_sec", "end_time_sec", "time_source",
+    "sequence", "idx1_entry_offset", "chunk_id", "vector_length", "x", "y", "z",
+]
+
 
 def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry_run=False):
     decode_summary = {}
@@ -1139,6 +1438,35 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
                 for i, (seq, line) in enumerate(unparsed_lines, start=1):
                     f.write(f"{i}. (entry #{seq}) {line}\n")
 
+        elif kind == "record72":
+            # 한 레코드에 GPS와 충격센서가 같이 들어 있어서 coordinates.*와
+            # sensor_values.csv를 같은 스트림에서 함께 만든다.
+            coord_rows = extract_result["coord_rows_by_stream"][s.index]
+            sensor_rows = extract_result["sensor_rows_by_stream"][s.index]
+            fix_rows = [r for r in coord_rows if r.get("latitude")]
+            decode_summary[s.index]["coord_count"] = len(coord_rows)
+            decode_summary[s.index]["fix_count"] = len(fix_rows)
+            decode_summary[s.index]["sensor_count"] = len(sensor_rows)
+            if dry_run:
+                continue
+
+            with open(os.path.join(stream_dir, "coordinates.csv"), "w", newline="",
+                       encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=RECORD72_COORD_FIELDS)
+                w.writeheader()
+                w.writerows(coord_rows)
+
+            with open(os.path.join(stream_dir, "coordinates.txt"), "w", encoding="utf-8") as f:
+                # 좌표 목록이라 측위 실패(status=V) 행은 뺀다. CSV에는 그대로 남는다.
+                for i, row in enumerate(fix_rows, start=1):
+                    f.write(f"{i}. {row['latitude']}, {row['longitude']}\n")
+
+            with open(os.path.join(stream_dir, "sensor_values.csv"), "w", newline="",
+                       encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=RECORD72_SENSOR_FIELDS)
+                w.writeheader()
+                w.writerows(sensor_rows)
+
         elif kind == "float_vector":
             sensor_rows = extract_result["sensor_rows_by_stream"][s.index]
             decode_summary[s.index]["sensor_count"] = len(sensor_rows)
@@ -1165,15 +1493,18 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
     if not dry_run:
         with open(decode_detect_csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["stream_index", "nmea_text", "generic_text", "float_vector",
-                        "binary", "decision"])
+            w.writerow(["stream_index", "nmea_text", "generic_text", "record72",
+                        "float_vector", "binary", "decision"])
             for s in selected_streams:
                 c = classify_counts.get(s.index, {})
                 info_row = decode_summary[s.index]
-                decision = {"text": "TEXT (디코딩됨)", "float_vector": "FLOAT_VECTOR (추정, 비공식)"}.get(
+                decision = {"text": "TEXT (디코딩됨)",
+                            "record72": "RECORD72 (FineVu 72바이트 고정 레코드, 디코딩됨)",
+                            "float_vector": "FLOAT_VECTOR (추정, 비공식)"}.get(
                     info_row["kind"], "BINARY/미상 (raw만 보존)")
                 w.writerow([s.index, c.get("nmea_text", 0), c.get("generic_text", 0),
-                            c.get("float_vector", 0), c.get("binary", 0), decision])
+                            c.get("record72", 0), c.get("float_vector", 0),
+                            c.get("binary", 0), decision])
 
     return decode_summary
 
@@ -1435,9 +1766,12 @@ def save_unknown_trailing_blob(mm, first_end, trailing, tag, out_dir):
             f"- 크기: {trailing:,} bytes\n"
             f"- 시작 4바이트 태그: {tag_disp!r}\n"
             "- 이 영역이 두 번째 RIFF(AVI/AVIX) 헤더로 시작하지 않아 자동으로 해석하지 "
-            "않았습니다. NMEA 텍스트 패턴도 발견되지 않아 벤더 고유 바이너리 포맷(예: "
-            "FineVu CustomGPS)일 가능성이 높습니다. 원본에서는 잘라내지 않았고, 이 raw "
-            "파일로만 별도 보존합니다.\n"
+            "않았습니다. 용도 미상의 벤더 고유 데이터로 보입니다. 원본에서는 잘라내지 "
+            "않았고, 이 raw 파일로만 별도 보존합니다.\n"
+            "- 주의: FineVu CustomGPS 계열에서 이 트레일링 블록을 GPS 저장 위치로 의심한 "
+            "적이 있는데 아니었습니다. 그 계열의 GPS/충격센서는 movi 안 txts 스트림의 "
+            "72바이트 고정 레코드에 들어 있고 이 스크립트가 이미 coordinates.csv 로 "
+            "뽑아냅니다. 이 블록은 그것과 무관합니다.\n"
         )
     info(f"[슬랙 판단] 미상 트레일링 데이터를 별도 보존함: {out_path}")
     return out_path
@@ -1600,9 +1934,16 @@ def process_single_file(input_path, output_root, args):
             n = entries_per_stream.get(st.index, 0)
             stream_times[st.index] = build_avi_stream_times(video_duration, n)
 
+        # 72바이트 레코드 경로에서 레코드별 절대 시각(abs_time)을 만들려면 녹화 시작
+        # 시각이 필요한데, 이 계열은 그 값을 파일 안에 안 남기고 파일명에만 남긴다
+        # (뷰어도 날짜/시간을 파일명에서 가져온다).
+        start_dt = finevu_filename_start_time(input_path)
+        if start_dt is not None:
+            info(f"[시간축] 파일명 기준 녹화 시작 시각 {start_dt:%Y-%m-%d %H:%M:%S}")
+
         result = extract_payload(
             mm, out_dir, selected_streams, idx1_entries, base_offset,
-            dry_run=args.dry_run, stream_times=stream_times)
+            dry_run=args.dry_run, stream_times=stream_times, start_dt=start_dt)
 
         save_metadata(out_dir, result["index_rows"], stream_table,
                        result["labels"], dry_run=args.dry_run)
@@ -1634,6 +1975,9 @@ def process_single_file(input_path, output_root, args):
             kind = ds.get("kind")
             if kind == "text":
                 extra = f", GPRMC/GPGGA 좌표 파싱 {ds.get('coord_count', 0)}개, 미분류 텍스트 {ds.get('unparsed_count', 0)}개"
+            elif kind == "record72":
+                extra = (f", FineVu 72바이트 레코드 {ds.get('coord_count', 0)}개 "
+                         f"(측위 성공 {ds.get('fix_count', 0)}개, 충격센서 {ds.get('sensor_count', 0)}개)")
             elif kind == "float_vector":
                 extra = f", float 벡터(추정, 비공식) 파싱 {ds.get('sensor_count', 0)}개"
             else:

@@ -1,4 +1,16 @@
 # ---- 이 파일은 파싱 로직이 없다. 시그니처로 AVI/MP4를 판별해 integration_avi.py / integration_mp4.py 로 넘기기만 한다 ----
+#
+# 컨테이너 아래의 벤더별 형식 분기는 각 통합 스크립트가 알아서 한다. 이 파일은
+# 거기까지 내려가지 않는다(형식이 늘어도 이 파일은 안 고친다는 뜻).
+#   AVI -> integration_avi.py
+#          - txts/GPSR 등에 NMEA 텍스트  (VUGERA, INAVI)
+#          - txts/dats 에 FineVu 72바이트 고정 이진 레코드 (FineVu X3000/X700 등)
+#          - float 벡터 센서 스트림 (VUGERA SENS)
+#   MP4 -> integration_mp4.py
+#          - moov/stbl 일반 구조 Atext (INAVI)
+#          - moov/udta/mamt $GNRMC (Land Rover)
+#          - fragmented moof/traf Atext (INAVI QXD8000, Mercedes-Benz)
+#          - 슬랙 카빙(--slack)
 import argparse
 import os
 import shlex
@@ -11,7 +23,19 @@ if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
     except AttributeError:
         pass
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# integration_avi/integration_mp4 는 저장소에서 "avi, mp4 integration" 폴더에 있고
+# 이 파일은 "final integration" 폴더에 있다. 세 파일을 한 폴더에 모아두고 쓰는
+# 경우도 있어서, 같은 폴더 -> 형제 폴더 순으로 찾아 sys.path 에 넣는다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SIBLING = os.path.join(os.path.dirname(_HERE), "avi, mp4 integration")
+for _cand in (_HERE, _SIBLING):
+    if os.path.isfile(os.path.join(_cand, "integration_avi.py")):
+        sys.path.insert(0, _cand)
+        break
+else:
+    sys.exit("integration_avi.py / integration_mp4.py 를 찾지 못했습니다. "
+             "이 파일과 같은 폴더나 'avi, mp4 integration' 폴더에 있어야 합니다.")
+
 import integration_avi
 import integration_mp4
 
@@ -72,7 +96,9 @@ def parse_args(argv):
     p = argparse.ArgumentParser(
         description="블랙박스 영상 GPS/센서 메타데이터 추출 최상위 진입점. "
                     "파일 시그니처로 AVI/MP4를 판별해 integration_avi.py 또는 "
-                    "integration_mp4.py로 넘긴다.")
+                    "integration_mp4.py로 넘긴다. 그 아래 벤더별 형식(NMEA 텍스트 / "
+                    "FineVu 72바이트 이진 레코드 / Atext / udta-mamt 등)은 각 통합 "
+                    "스크립트가 내용을 보고 자동으로 고른다.")
     p.add_argument("inputs", nargs="+", help="입력 영상 파일 경로(들). AVI/MP4 섞어도 됨")
     p.add_argument("-o", "--output", default=None,
                     help="결과를 저장할 루트 디렉터리 (--detect-only 면 생략 가능)")
