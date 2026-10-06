@@ -9,7 +9,11 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
+# PyInstaller windowed(console=False) 빌드나 pythonw에서는 sys.stdout이 아예
+# None이다. 여기서 .encoding을 바로 읽으면 import 단계에서 AttributeError로
+# 죽고, 콘솔이 없어 트레이스백조차 안 보인다.
+if sys.stdout is not None and (
+        sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -327,7 +331,10 @@ def parse_moov(f, moov_box):
         if track_id is None or handler_type is None or timescale is None:
             continue
         debug(f"[TRACK] track_ID={track_id} handler_type={handler_type!r} timescale={timescale}")
-        if handler_type == b"text":
+        # route B(sample table)와 같은 기준을 쓴다. 여기만 b"text"로 좁게 잡으면
+        # GPS가 sbtl/subt handler에 실린 fragmented 파일이 "text Track 없음"으로
+        # 통째로 실패한다 - moof가 있으면 route A가 우선 선택되므로 대안 경로도 없다.
+        if handler_type in SUPPORTED_TEXT_HANDLERS:
             text_tracks[track_id] = TextTrackInfo(track_id=track_id, timescale=timescale,
                                                    handler_type=handler_type,
                                                    handler_name=handler_name)
@@ -396,21 +403,31 @@ def parse_tfhd(f, tfhd_box):
     default_size = None
     default_flags = None
 
+    # 선택 필드는 flags에 선언된 만큼만 뒤에 붙는다. 잘린 파일(주행 중 전원이 끊겨
+    # 기록이 중간에 끝난 경우 등)에서 선언과 실제 길이가 어긋나면 struct.error가
+    # 그대로 위로 올라가 그 파일 처리가 통째로 중단되므로, trun과 같은 방식으로
+    # 읽기 전에 남은 길이를 확인한다.
+    def _take(width, field_name):
+        nonlocal off
+        if off + width > len(payload):
+            warn(f"tfhd @ 0x{tfhd_box.start:X}: {field_name}을 읽을 공간이 부족함 "
+                 f"(flags=0x{flags:06X}, payload {len(payload)}바이트) - 이 필드부터 생략")
+            return None, True
+        value = struct.unpack(">Q" if width == 8 else ">I", payload[off:off + width])[0]
+        off += width
+        return value, False
+
+    truncated = False
     if flags & TFHD_BASE_DATA_OFFSET_PRESENT:
-        base_data_offset = struct.unpack(">Q", payload[off:off + 8])[0]
-        off += 8
-    if flags & TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT:
-        sdi = struct.unpack(">I", payload[off:off + 4])[0]
-        off += 4
-    if flags & TFHD_DEFAULT_SAMPLE_DURATION_PRESENT:
-        default_duration = struct.unpack(">I", payload[off:off + 4])[0]
-        off += 4
-    if flags & TFHD_DEFAULT_SAMPLE_SIZE_PRESENT:
-        default_size = struct.unpack(">I", payload[off:off + 4])[0]
-        off += 4
-    if flags & TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT:
-        default_flags = struct.unpack(">I", payload[off:off + 4])[0]
-        off += 4
+        base_data_offset, truncated = _take(8, "base_data_offset")
+    if not truncated and flags & TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT:
+        sdi, truncated = _take(4, "sample_description_index")
+    if not truncated and flags & TFHD_DEFAULT_SAMPLE_DURATION_PRESENT:
+        default_duration, truncated = _take(4, "default_sample_duration")
+    if not truncated and flags & TFHD_DEFAULT_SAMPLE_SIZE_PRESENT:
+        default_size, truncated = _take(4, "default_sample_size")
+    if not truncated and flags & TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT:
+        default_flags, truncated = _take(4, "default_sample_flags")
 
     tfhd = TfhdInfo(track_id=track_id, flags=flags, base_data_offset=base_data_offset,
                      sample_description_index=sdi, default_sample_duration=default_duration,
@@ -2194,7 +2211,7 @@ def run_fragmented(f, filesize, out_dir, args):
 
     text_tracks, trex_defaults, all_tracks = parse_moov(f, moov_boxes[0])
     if not text_tracks:
-        warn("handler_type == 'text' 인 Track을 찾지 못함")
+        warn("text/sbtl/subt handler를 가진 Track을 찾지 못함")
         return None
 
     if args.track_id is not None:
@@ -2304,6 +2321,11 @@ def _utc_to_seconds(utc_time):
         return None
 
 
+# GPS UTC가 이만큼 이상 뒤로 가야 자정 넘김으로 본다. 몇 초짜리 역행은
+# 중복/순서 뒤바뀜이라 하루를 더하면 시간축이 통째로 붕괴한다.
+UTC_MIDNIGHT_MIN_DROP_SEC = 43200.0
+
+
 def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
     """coord_rows에 start_time_sec/end_time_sec/time_source를 채운다.
     첫 문장의 UTC가 0초. 자정을 넘어가면 하루(86400초)를 더해 이어붙인다."""
@@ -2318,11 +2340,20 @@ def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
             row["end_time_sec"] = ""
             row["time_source"] = ""
             continue
-        if prev is not None and secs + carry < prev:
-            # 23:59:59 -> 00:00:00 처럼 되감기면 자정을 넘긴 것으로 본다.
-            carry += 86400.0
+        if prev is not None:
+            drop = prev - (secs + carry)
+            if drop >= UTC_MIDNIGHT_MIN_DROP_SEC:
+                # 23:59:59 -> 00:00:00 처럼 하루가 통째로 되감긴 경우만 자정으로 본다.
+                carry += 86400.0
+            elif drop > 0:
+                # 같은 문장이 중복되거나 순서가 뒤바뀌면 몇 초쯤 뒤로 갈 수 있다.
+                # 이걸 자정으로 오인해 86400초를 더하면 그 뒤 전 구간의 시간축이
+                # 통째로 밀려버리므로, 여기서는 값을 그대로 두고 기록만 남긴다.
+                warn(f"GPS UTC가 {drop:.3f}초 뒤로 감 (utc_time={row.get('utc_time')!r}) "
+                     f"- 자정 넘김이 아니라 중복/순서 뒤바뀜으로 보고 시간축을 그대로 둠")
         value = secs + carry
-        prev = value
+        # 한 번 튄 값 때문에 이후 비교 기준이 낮아지지 않도록 최댓값을 유지한다.
+        prev = value if prev is None else max(prev, value)
         if base is None:
             base = value
         start = value - base
@@ -2555,6 +2586,16 @@ def build_slack_sensor_row(off, region_kind, payload, segment):
     row["raw"] = segment
     return row
 
+
+
+def detect_slack_info(path):
+    """앱이 영상을 고를 때 묻는 용도: 슬랙(free/skip Box·gap·trailing)이 있는지와 크기."""
+    filesize = os.path.getsize(path)
+    with open(path, "rb") as f:
+        regions, _boxes = find_slack_regions(f, filesize)
+    total = sum(e - s for _, s, e in regions)
+    return {"container": "mp4", "has_slack": bool(regions), "slack_bytes": total,
+            "regions": [{"kind": k, "start": s, "end": e} for k, s, e in regions]}
 
 
 def run_slack_carve(f, filesize, out_dir, args):

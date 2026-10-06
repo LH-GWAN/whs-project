@@ -16,7 +16,11 @@ import os
 import shlex
 import sys
 
-if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
+# PyInstaller windowed(console=False) 빌드나 pythonw에서는 sys.stdout이 아예
+# None이다. 여기서 .encoding을 바로 읽으면 import 단계에서 AttributeError로
+# 죽고, 콘솔이 없어 트레이스백조차 안 보인다.
+if sys.stdout is not None and (
+        sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -107,8 +111,11 @@ def parse_args(argv):
     p.add_argument("--detect-only", action="store_true",
                     help="컨테이너 판별 결과만 출력하고 추출은 하지 않음")
     p.add_argument("--slack", action="store_true",
-                    help="MP4 슬랙에서 과거 녹화분 GPS/G센서를 추가로 카빙한다(기본 안 함). "
-                         "AVI 쪽 슬랙 리페어는 이 옵션과 무관하게 항상 수행됨")
+                    help="슬랙(컨테이너가 참조하지 않는 영역)에서 과거 녹화분 GPS/G센서를 추가로 "
+                         "카빙한다(기본 안 함). MP4/AVI 모두. AVI 슬랙은 잘라내지 않고 그대로 둔다"
+                         "(--avi-opt=--repair-slack 을 주면 절단본을 만든다)")
+    p.add_argument("--detect-slack", action="store_true",
+                    help="추출하지 않고 파일마다 슬랙 유무·크기만 JSON 한 줄(SLACK_JSON …)로 출력")
     # 값이 "-"로 시작하면 argparse가 옵션으로 오인하므로 반드시 = 형태로 붙여 써야 한다.
     #   O   --mp4-opt="--track-id 3"
     #   X   --mp4-opt "--track-id 3"
@@ -119,7 +126,7 @@ def parse_args(argv):
                     help='integration_mp4.py 로 그대로 넘길 인자. 반드시 = 로 붙여 쓸 것 '
                          '(예: --mp4-opt="--track-id 3"). 여러 번 지정 가능')
     args = p.parse_args(argv)
-    if args.output is None and not args.detect_only:
+    if args.output is None and not (args.detect_only or args.detect_slack):
         p.error("-o/--output 은 --detect-only 가 아닐 때 반드시 필요합니다")
     args.avi_opt = [tok for chunk in args.avi_opt for tok in shlex.split(chunk)]
     args.mp4_opt = [tok for chunk in args.mp4_opt for tok in shlex.split(chunk)]
@@ -158,6 +165,24 @@ def main(argv=None):
               f"MP4 {len(groups[CONTAINER_MP4])}개 / 처리 불가 {len(skipped)}개")
         return
 
+    if args.detect_slack:
+        # 앱이 영상을 고른 직후 "슬랙 데이터가 있는데 따로 뽑을까요?"를 묻는 데 쓴다.
+        import json
+        for container, paths in groups.items():
+            detector = integration_avi.detect_slack_info if container == CONTAINER_AVI \
+                else integration_mp4.detect_slack_info
+            for path in paths:
+                try:
+                    result = detector(path)
+                except Exception as exc:
+                    result = {"container": container, "has_slack": False, "error": str(exc)}
+                result["path"] = path
+                print("SLACK_JSON " + json.dumps(result, ensure_ascii=False))
+        for path, reason in skipped:
+            print("SLACK_JSON " + json.dumps({"path": path, "has_slack": False, "error": reason},
+                                             ensure_ascii=False))
+        return
+
     results = []
 
     if groups[CONTAINER_AVI]:
@@ -165,6 +190,8 @@ def main(argv=None):
         argv_avi = ["-o", args.output]
         if args.dry_run:
             argv_avi.append("--dry-run")
+        if args.slack:
+            argv_avi.append("--slack")
         argv_avi += args.avi_opt + groups[CONTAINER_AVI]
         try:
             integration_avi.main(argv_avi)

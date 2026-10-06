@@ -11,7 +11,11 @@ import struct
 import sys
 from dataclasses import dataclass, field
 
-if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
+# PyInstaller windowed(console=False) 빌드나 pythonw에서는 sys.stdout이 아예
+# None이다. 여기서 .encoding을 바로 읽으면 import 단계에서 AttributeError로
+# 죽고, 콘솔이 없어 트레이스백조차 안 보인다.
+if sys.stdout is not None and (
+        sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -1777,10 +1781,131 @@ def save_unknown_trailing_blob(mm, first_end, trailing, tag, out_dir):
     return out_path
 
 
-def handle_slack(input_path, mm, out_dir, dry_run=False):
+def slack_regions_avi(mm, analysis=None):
+    """컨테이너(idx1)가 참조하지 않는 영역: [(kind, start, end)].
+      embedded : movi 안에서 옛 녹화 파일 잔재(RIFF)가 처음 나타난 곳부터 movi 끝까지
+      trailing : 최상위 RIFF가 끝난 뒤의 꼬리(정렬 패딩 수준은 무시)
+    현재 녹화분은 idx1이 가리키는 chunk뿐이라 그 뒤는 전부 예전 기록이 남은 자리다."""
+    if analysis is None:
+        analysis = analyze_slack(mm)
+    if analysis.get("kind") != "riff":
+        return []
+    regions = []
+    embedded = analysis["embedded_riffs"]
+    if embedded and analysis["movi_list"]:
+        movi = analysis["movi_list"][0]
+        start = min(e["pos"] for e in embedded)
+        if movi.content_end > start:
+            regions.append(("embedded", start, movi.content_end))
+    if analysis["extra_after_bytes"] >= TRAILING_IGNORE_THRESHOLD:
+        s0 = analysis["extra_after_pos"]
+        regions.append(("trailing", s0, s0 + analysis["extra_after_bytes"]))
+    return regions
+
+
+def detect_slack_info(path):
+    """앱이 영상을 고를 때 묻는 용도: 슬랙이 있는지와 크기. 추출은 하지 않는다."""
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            analysis = analyze_slack(mm)
+            regions = slack_regions_avi(mm, analysis)
+        finally:
+            mm.close()
+    total = sum(e - s for _, s, e in regions)
+    return {
+        "container": "avi",
+        "has_slack": bool(regions),
+        "slack_bytes": total,
+        "regions": [{"kind": k, "start": s, "end": e} for k, s, e in regions],
+        "embedded_riffs": len(analysis.get("embedded_riffs", [])) if analysis.get("kind") == "riff" else 0,
+        "top_riffs": analysis.get("top_riff_count", 0) if analysis.get("kind") == "riff" else 0,
+    }
+
+
+SLACK_NMEA_RE = re.compile(rb"\$?[A-Z]{2}(?:RMC|GGA),[ -~]*")
+
+
+def run_slack_carve_avi(mm, out_dir, dry_run=False):
+    """슬랙 영역에서 NMEA GPS 문장을 카빙해 <out_dir>/slack/ 에 남긴다. 원본은 수정하지 않는다.
+    열 구성은 integration_mp4.py 의 슬랙 카빙과 같다(앱이 같은 코드로 읽는다). FineVu 72바이트
+    이진 레코드는 텍스트가 아니라 여기서 찾지 못한다(NMEA 기기만 해당)."""
+    regions = slack_regions_avi(mm)
+    if not regions:
+        info("[슬랙] 옛 녹화 잔재도 트레일링 영역도 없음 - 카빙 대상 없음")
+        return None
+    total = sum(e - s for _, s, e in regions)
+    info(f"\n[슬랙] 컨테이너가 참조하지 않는 영역 {len(regions)}개 / {total:,} bytes "
+         f"(전체의 {total / len(mm) * 100:.1f}%)")
+    coord_rows, region_stats = [], []
+    for kind, s, e in regions:
+        info(f"  [{kind}] 0x{s:08X} ~ 0x{e:08X}  ({e - s:,} bytes)")
+        n_gps = 0
+        for m in SLACK_NMEA_RE.finditer(mm, s, e):
+            parsed = try_parse_nmea(m.group().decode("ascii", errors="replace"))
+            if parsed is None:
+                continue
+            speed_kmh = parsed.get("speed_kmh")
+            coord_rows.append({
+                "date": parsed.get("date", ""), "utc_time": parsed.get("utc_time", ""),
+                "status": parsed.get("status", ""),
+                "latitude": f"{parsed['lat']:.6f}" if parsed.get("lat") is not None else "",
+                "longitude": f"{parsed['lon']:.6f}" if parsed.get("lon") is not None else "",
+                "speed_knots": parsed.get("speed_knots", ""),
+                "speed_kmh": f"{speed_kmh:.3f}" if speed_kmh is not None else "",
+                "track_deg": parsed.get("track_deg", ""),
+                "checksum_ok": parsed.get("checksum_ok"),
+                "status_valid": parsed.get("status_valid", ""),
+                "trusted": parsed.get("trusted", ""),
+                "parse_warnings": parsed.get("parse_warnings", ""),
+                "slack_region": kind,
+                "absolute_offset": f"0x{m.start():08X}",
+                "sentence_type": parsed.get("sentence_type", ""),
+                "raw_sentence": parsed.get("raw", ""),
+            })
+            n_gps += 1
+        region_stats.append({"region_kind": kind, "start": f"0x{s:08X}", "end": f"0x{e:08X}",
+                             "size_bytes": e - s, "gps_records": n_gps})
+    dates = sorted({r["date"] for r in coord_rows if r["date"]})
+    info(f"  -> GPS {len(coord_rows)}건" + (f", 슬랙 GPS 기록일: {dates}" if dates else ""))
+    if not dry_run:
+        slack_dir = os.path.join(out_dir, "slack")
+        os.makedirs(slack_dir, exist_ok=True)
+        _write_dict_csv(os.path.join(slack_dir, "slack_regions.csv"), region_stats)
+        _write_dict_csv(os.path.join(slack_dir, "slack_coordinates.csv"), coord_rows)
+        with open(os.path.join(slack_dir, "README.txt"), "w", encoding="utf-8") as fp:
+            fp.write(
+                "이 폴더의 내용은 AVI 컨테이너(idx1)가 참조하지 않는 영역 - movi 안에 남은 예전\n"
+                "녹화 파일의 잔재(embedded)와 최상위 RIFF 뒤의 꼬리(trailing) - 에서 카빙한\n"
+                "NMEA GPS 문장입니다.\n\n"
+                "- 현재 녹화분이 아니라 같은 저장매체에 예전에 기록됐던 내용입니다.\n"
+                "- 재생 시각(영상 시간축)에 매핑할 수 없습니다. 절대 byte offset만 남깁니다.\n"
+                "- 해석/검증은 정상 추출분과 같습니다(checksum 포함). checksum_ok=False 인 행은\n"
+                "  우연히 만들어진 바이트열일 수 있습니다.\n"
+                "- 원본 파일은 수정하지 않았습니다.\n")
+    return {"regions": len(regions), "slack_bytes": total, "gps": len(coord_rows), "dates": dates}
+
+
+def _write_dict_csv(path, rows):
+    if not rows:
+        return
+    fieldnames = []
+    for row in rows:
+        for k in row.keys():
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def handle_slack(input_path, mm, out_dir, dry_run=False, repair=False):
     """반환값: (사용할 파일 경로, 새 파일을 만들었는지 여부).
-    out_dir(이 파일의 최종 결과 폴더) 안에 슬랙 제거본/미상 트레일링 raw를
-    바로 만들어서 결과물로 눈에 보이게 남긴다.
+    repair=True 일 때만 out_dir 안에 슬랙 제거본(<파일명>_wo_slack.avi)을 만들어 그걸로
+    추출한다. 기본(repair=False)은 슬랙을 **자르지 않고 무시**한다 - idx1은 현재 녹화분만
+    가리키므로 슬랙 유무는 GPS 추출 결과에 영향을 주지 않고, 원본 외 파생 영상을 만들지
+    않는 편이 증거 취급에 낫다. 슬랙 안의 옛 GPS는 --slack 으로 따로 카빙한다.
     dry_run이면 판단 결과만 출력하고 파일은 하나도 만들지 않는다."""
     analysis = analyze_slack(mm)
     if analysis["kind"] == "not_riff":
@@ -1819,6 +1944,13 @@ def handle_slack(input_path, mm, out_dir, dry_run=False):
 
     need_repair = bool(embedded) or top_count >= 2
     if not need_repair:
+        return input_path, False
+
+    if not repair:
+        info(f"[슬랙 판단] RIFF {top_count + len(embedded)}개 감지"
+             f"(최상위 {top_count}개 + movi 내부 예전 파일 잔재 {len(embedded)}개) - "
+             "자르지 않고 원본 그대로 추출함(--repair-slack 을 주면 절단본을 만든다). "
+             "idx1은 현재 녹화분만 가리키므로 추출 결과는 같다")
         return input_path, False
 
     info(f"[슬랙 판단] RIFF {top_count + len(embedded)}개 감지"
@@ -1862,7 +1994,13 @@ def process_single_file(input_path, output_root, args):
     with open(input_path, "rb") as f:
         mm0 = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         process_path, is_new_file = handle_slack(input_path, mm0, out_dir,
-                                                  dry_run=args.dry_run)
+                                                  dry_run=args.dry_run,
+                                                  repair=getattr(args, "repair_slack", False))
+        if getattr(args, "slack", False):
+            try:
+                run_slack_carve_avi(mm0, out_dir, dry_run=args.dry_run)
+            except Exception as exc:
+                warn(f"슬랙 카빙 중 예외 - 정상 추출 결과에는 영향 없음: {exc}")
         mm0.close()
         if is_new_file:
             work_path = process_path
@@ -2009,6 +2147,12 @@ def parse_args(argv):
                     help="by_index 모드용 스트림 번호. 여러 번 지정 가능")
     p.add_argument("--chunk-id", action="append", default=None,
                     help="explicit 모드용 movi chunk ID (예: 02st). 여러 번 지정 가능")
+    p.add_argument("--repair-slack", action="store_true",
+                    help="movi 안 옛 녹화 잔재/중복 RIFF가 있으면 <파일명>_wo_slack.avi 로 잘라낸 "
+                         "뒤 추출한다. 기본은 자르지 않고 무시(추출 결과는 같다)")
+    p.add_argument("--slack", action="store_true",
+                    help="슬랙(옛 녹화 잔재·트레일링 영역)에서 NMEA GPS 문장을 추가로 카빙해 "
+                         "<out>/slack/slack_coordinates.csv 로 남긴다(기본 안 함)")
     return p.parse_args(argv)
 
 
@@ -2016,8 +2160,38 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if not args.dry_run:
         os.makedirs(args.output, exist_ok=True)
+
+    # 파일 하나가 죽어도 나머지는 계속 처리한다(integration_mp4.py와 같은 방식).
+    # 앞쪽 손상 파일 하나 때문에 배치 전체가 안 돌아가는 걸 막기 위함.
+    results = []
     for input_path in args.inputs:
-        process_single_file(input_path, args.output, args)
+        name = os.path.basename(input_path)
+        if not os.path.isfile(input_path):
+            info(f"[SKIP] {input_path}: 파일을 찾을 수 없음")
+            results.append((name, "파일을 찾을 수 없음"))
+            continue
+        try:
+            process_single_file(input_path, args.output, args)
+            results.append((name, None))
+        except SystemExit as exc:
+            # assert_riff_file 등이 sys.exit()으로 빠져나온다. 여기서 잡아야
+            # 배치의 나머지 파일이 같이 죽지 않는다.
+            results.append((name, f"처리 중단 (종료 코드 {exc.code})"))
+            warn(f"{name}: 처리 중단 (종료 코드 {exc.code})")
+        except Exception as exc:
+            results.append((name, f"예외: {exc}"))
+            warn(f"{name}: 예외 발생으로 처리 중단: {exc}")
+
+    if len(results) > 1:
+        info("\n" + "=" * 70)
+        info("[전체 요약]")
+        for name, err in results:
+            info(f"  {'OK  ' if err is None else 'FAIL'} {name:44}"
+                 f"{'' if err is None else '  ' + err}")
+        info("=" * 70)
+
+    if results and all(err is not None for _, err in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
