@@ -2500,10 +2500,16 @@ def find_slack_regions(f, filesize):
     """
     regions = []
     boxes = []
+    appended_at = None
     pos = 0
     while pos + 8 <= filesize:
         box = read_box_header(f, pos, filesize, context="slack-scan", allow_size_zero=True)
         if box is None:
+            break
+        # 두 번째 ftyp 부터는 옛 녹화 파일이 통째로 이어붙은 것이다(AVI의 appended_riff와 같은
+        # 경우). 그 뒤는 Box를 더 따라가지 않고 끝까지 슬랙으로 본다.
+        if box.box_type == b"ftyp" and pos > 0:
+            appended_at = pos
             break
         boxes.append(box)
         if box.start > pos:
@@ -2519,7 +2525,9 @@ def find_slack_regions(f, filesize):
                             box.payload_start, box.end))
         prev_end = box.end
 
-    if prev_end < filesize:
+    if appended_at is not None:
+        regions.append(("appended_file", appended_at, filesize))
+    elif prev_end < filesize:
         regions.append(("trailing", prev_end, filesize))
 
     regions = [(k, s, e) for k, s, e in regions if e - s >= MIN_SLACK_REGION]

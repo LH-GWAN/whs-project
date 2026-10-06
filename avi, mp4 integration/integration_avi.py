@@ -1783,8 +1783,9 @@ def save_unknown_trailing_blob(mm, first_end, trailing, tag, out_dir):
 
 def slack_regions_avi(mm, analysis=None):
     """컨테이너(idx1)가 참조하지 않는 영역: [(kind, start, end)].
-      embedded : movi 안에서 옛 녹화 파일 잔재(RIFF)가 처음 나타난 곳부터 movi 끝까지
-      trailing : 최상위 RIFF가 끝난 뒤의 꼬리(정렬 패딩 수준은 무시)
+      embedded      : movi 안에서 옛 녹화 파일 잔재(RIFF)가 처음 나타난 곳부터 movi 끝까지
+      appended_riff : 첫 RIFF가 선언한 크기 뒤에 온전한 RIFF(옛 녹화 파일)가 통째로 이어붙은 경우
+      trailing      : 첫 RIFF가 끝난 뒤의 미상 꼬리(정렬 패딩 수준은 무시)
     현재 녹화분은 idx1이 가리키는 chunk뿐이라 그 뒤는 전부 예전 기록이 남은 자리다."""
     if analysis is None:
         analysis = analyze_slack(mm)
@@ -1797,9 +1798,16 @@ def slack_regions_avi(mm, analysis=None):
         start = min(e["pos"] for e in embedded)
         if movi.content_end > start:
             regions.append(("embedded", start, movi.content_end))
-    if analysis["extra_after_bytes"] >= TRAILING_IGNORE_THRESHOLD:
-        s0 = analysis["extra_after_pos"]
-        regions.append(("trailing", s0, s0 + analysis["extra_after_bytes"]))
+    # 첫 번째 최상위 RIFF가 선언한 크기 뒤는 전부 슬랙이다 - 미상 꼬리든, 온전한 RIFF(옛 녹화 파일)가
+    # 통째로 이어붙어 있든 마찬가지다(count_top_level_riffs는 뒤의 RIFF를 정상 파일로 세므로 거기에
+    # 기대면 이 경우를 놓친다).
+    filesize = len(mm)
+    if filesize >= 12 and bytes(mm[0:4]) == b"RIFF":
+        first_end = 8 + struct.unpack_from("<I", mm, 4)[0]
+        first_end += first_end & 1
+        if first_end < filesize - TRAILING_IGNORE_THRESHOLD:
+            kind = "appended_riff" if bytes(mm[first_end:first_end + 4]) == b"RIFF" else "trailing"
+            regions.append((kind, first_end, filesize))
     return regions
 
 
