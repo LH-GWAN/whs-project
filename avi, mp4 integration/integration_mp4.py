@@ -2,6 +2,7 @@
 import argparse
 import csv
 import math
+import mmap
 import os
 import re
 import struct
@@ -26,6 +27,25 @@ WARNINGS = []
 MAX_SAMPLE_COUNT_PER_RUN = 200_000
 
 KEPT_KINDS = {"gsensor", "gps_nmea", "vendor_raw"}
+
+_CSV_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_guard(v):
+    """파일에서 읽은 문자열이 '='로 시작하면 Excel이 수식으로 실행한다(리뷰 #123). 숫자는 그대로 둔다."""
+    if isinstance(v, str) and v and v[0] in _CSV_FORMULA_PREFIX:
+        try:
+            float(v)
+            return v
+        except ValueError:
+            return "'" + v
+    return v
+
+
+class _GuardDictWriter(csv.DictWriter):
+    def _dict_to_list(self, rowdict):
+        return [_csv_guard(v) for v in super()._dict_to_list(rowdict)]
+
 
 def warn(msg):
     WARNINGS.append(msg)
@@ -614,15 +634,30 @@ VENDOR_DOLLAR_RE = re.compile(r"^\$(?P<tag>[A-Za-z]+)(?P<rest>.*)$", re.DOTALL)
 
 NMEA_TYPES_WITH_POSITION = ("RMC", "GGA")
 
+def _looks_like_text_trailer(rest):
+    """길이 프리픽스 텍스트 뒤에 붙는 것: 0 패딩이거나 tx3g 수식 Box(encd/styl 등, 8바이트 머리)."""
+    if not rest or not any(rest):
+        return True
+    if len(rest) >= 8:
+        size = struct.unpack(">I", rest[:4])[0]
+        typ = rest[4:8]
+        return 8 <= size <= len(rest) and all(32 <= b < 127 for b in typ)
+    return False
+
+
 def decode_sample_text(raw_bytes):
     if len(raw_bytes) >= TEXT_LENGTH_PREFIX_SIZE:
         declared_len = struct.unpack(">H", raw_bytes[:2])[0]
-        if declared_len + TEXT_LENGTH_PREFIX_SIZE == len(raw_bytes):
+        # 선언 길이가 sample 전체와 정확히 같을 때만 인정하면 패딩·수식 Box가 붙은 파일이 UNDECODABLE이
+        # 됐다(리뷰 #56). 선언 길이까지만 텍스트로 읽고 나머지가 패딩·Box면 무시한다.
+        if 0 < declared_len <= len(raw_bytes) - TEXT_LENGTH_PREFIX_SIZE:
             text_bytes = raw_bytes[2:2 + declared_len]
-            try:
-                return text_bytes.decode("utf-8"), True
-            except UnicodeDecodeError:
-                return text_bytes.decode("latin1", errors="replace"), True
+            rest = raw_bytes[2 + declared_len:]
+            if _looks_like_text_trailer(rest):
+                try:
+                    return text_bytes.decode("utf-8"), True
+                except UnicodeDecodeError:
+                    return text_bytes.decode("latin1", errors="replace"), True
 
     stripped = raw_bytes.rstrip(b"\x00")
     if stripped and all((32 <= b < 127) or b in (9, 10, 13) for b in stripped):
@@ -982,11 +1017,68 @@ def parse_moof(f, moof_box, moof_index, text_track_id, timescale, trex_defaults,
             prev_traf_data_end=prev_traf_data_end,
             track_dts_state=track_dts_state, out_samples=out_samples)
 
+def _moof_decode_times(f, moof_box):
+    """moof 안 traf마다 {track_id: tfdt baseMediaDecodeTime}. 못 읽으면 빈 dict."""
+    times = {}
+    try:
+        for traf in find_all(list(iter_child_boxes(f, moof_box.payload_start, moof_box.end,
+                                                   context="boundary-moof")), b"traf"):
+            children = list(iter_child_boxes(f, traf.payload_start, traf.end, context="boundary-traf"))
+            tfhd_box, tfdt_box = find_box(children, b"tfhd"), find_box(children, b"tfdt")
+            if tfhd_box is None or tfdt_box is None:
+                continue
+            t = parse_tfdt(f, tfdt_box)
+            if t is not None:
+                times[parse_tfhd(f, tfhd_box).track_id] = t
+    except Exception:  # noqa: BLE001 - 경계 판단은 보조 정보라 실패해도 순회는 계속한다
+        return {}
+    return times
+
+
+def scan_top_level_bounded(f, filesize):
+    """현재 녹화분의 최상위 Box 목록과 경계. 반환값: (boxes, boundary, boundary_kind).
+
+    같은 저장매체에 예전 녹화 파일이 통째로 이어붙어 있으면(현재 파일이 선언한 끝 뒤에 두 번째
+    ftyp, 또는 tfdt가 되감기는 moof) 거기서 순회를 멈춘다. 예전엔 파일 끝까지 moof/moov를 모아
+    옛 녹화의 GPS가 같은 재생 시각에 섞이고 현재 녹화가 '위치 급변' 이상치로 빠졌다(리뷰 #2).
+    boundary가 None이 아니면 그 뒤는 슬랙(옛 녹화)으로 다룬다. boundary_kind:
+      "ftyp"      두 번째 ftyp
+      "tfdt"      같은 track의 tfdt가 앞 moof보다 작아짐(조각만 이어붙은 옛 녹화)
+      "truncated" 헤더는 읽혔지만 선언 크기가 파일 끝을 넘는 Box(잘린 현재 녹화) - 슬랙이 아님
+      "corrupt"   Box 헤더를 읽을 수 없음
+    """
+    boxes = []
+    last_times = {}
+    pos = 0
+    while pos < filesize:
+        box = read_box_header(f, pos, filesize, context="top-level", allow_size_zero=True)
+        if box is None:
+            kind = "corrupt"
+            if pos + 8 <= filesize:
+                f.seek(pos)
+                header = f.read(8)
+                size32 = struct.unpack(">I", header[0:4])[0]
+                if all(0x20 <= b < 0x7F for b in header[4:8]) and size32 >= 8 and pos + size32 > filesize:
+                    kind = "truncated"
+            return boxes, pos, kind
+        if box.box_type == b"ftyp" and box.start > 0:
+            warn(f"최상위 @ 0x{box.start:X}: 두 번째 ftyp - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
+            return boxes, box.start, "ftyp"
+        if box.box_type == b"moof":
+            times = _moof_decode_times(f, box)
+            if any(tid in last_times and t < last_times[tid] for tid, t in times.items()):
+                warn(f"moof @ 0x{box.start:X}: tfdt가 앞 조각보다 작아짐 - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
+                return boxes, box.start, "tfdt"
+            last_times.update(times)
+        boxes.append(box)
+        pos = box.end
+    return boxes, None, None
+
+
 def scan_top_level(f, filesize):
-    top_boxes = []
-    for box in iter_child_boxes(f, 0, filesize, context="top-level", allow_size_zero=True):
-        top_boxes.append(box)
-    return top_boxes
+    """현재 녹화분의 최상위 Box만(경계 뒤는 제외). 모든 경로가 이 함수를 써야 본 궤적과 슬랙이
+    같은 경계를 쓴다."""
+    return scan_top_level_bounded(f, filesize)[0]
 
 def format_gsensor(payload):
     lines = [f"    [GSENSOR] subtype={payload.get('subtype') or '-'}"]
@@ -1121,7 +1213,7 @@ def write_csv(path, rows):
                 seen.add(k)
                 fieldnames.append(k)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = _GuardDictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
 
@@ -1172,7 +1264,11 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
         gsensor_payload = None
         for kind, payload in s.parsed_segments:
             if kind == "gps_nmea":
-                gps_payload = payload
+                # sample 하나에 RMC 뒤에 GGA가 오면 마지막 문장(GGA)이 대표가 되어 timeline의
+                # 속도·날짜가 사라졌다(리뷰 #8). 속도·날짜를 가진 RMC가 있으면 그것을 대표로 둔다.
+                if gps_payload is None or (payload.get("sentence_type") == "RMC"
+                                           and gps_payload.get("sentence_type") != "RMC"):
+                    gps_payload = payload
                 speed_kmh = payload.get("speed_kmh")
                 coord_rows.append({
                     "sample": s.sample_index,
@@ -1885,7 +1981,9 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
             elif kind == "gps_nmea":
                 parsed = payload
                 speed_kmh = parsed.get("speed_kmh")
-                timeline_gps = parsed
+                if timeline_gps is None or (parsed.get("sentence_type") == "RMC"
+                                            and timeline_gps.get("sentence_type") != "RMC"):
+                    timeline_gps = parsed   # RMC 우선(리뷰 #8)
                 coord_rows.append({
                     "sample": s.sample_number,
                     "start_time_sec": _fmt_sec(start_sec),
@@ -1972,7 +2070,7 @@ def _write_csv(path, rows):
                 seen.add(k)
                 fieldnames.append(k)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = _GuardDictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
 
@@ -2054,7 +2152,7 @@ def try_parse_rmc_sentence(raw):
     return parsed
 
 def locate_gps_source(f, filesize):
-    top_boxes = list(iter_boxes(f, 0, filesize, context="top-level"))
+    top_boxes = scan_top_level(f, filesize)
     top_types = [b.box_type for b in top_boxes]
 
     if b"moof" in top_types and b"moov" not in top_types:
@@ -2133,7 +2231,7 @@ ROUTE_UDTA_MAMT = "udta_mamt"
 def probe_container(f, filesize):
     """반환값: dict(route, brand, compatible, moof_count, handlers, reason)
     route가 None이면 지원하지 않는 구조이고 reason에 이유가 들어간다."""
-    top = list(iter_child_boxes(f, 0, filesize, context="top-level", allow_size_zero=True))
+    top = scan_top_level(f, filesize)
     top_types = [b.box_type for b in top]
 
     brand, compat = "", []
@@ -2213,6 +2311,18 @@ def run_fragmented(f, filesize, out_dir, args):
     if not text_tracks:
         warn("text/sbtl/subt handler를 가진 Track을 찾지 못함")
         return None
+    # 혼합(hybrid) 파일: moov의 sample table에도 sample이 있으면(첫 구간) 이 경로는 moof만 읽어
+    # 그 구간이 빠진다. 조용히 넘어가지 않고 경고로 남긴다(리뷰 #23).
+    try:
+        moov_children = list(iter_child_boxes(f, moov_boxes[0].payload_start, moov_boxes[0].end,
+                                               context="moov-hybrid"))
+        for n, trak_box in enumerate(find_all(moov_children, b"trak"), start=1):
+            ti = parse_track(f, trak_box, n)
+            if ti.is_text_track and ti.samples:
+                warn(f"moov sample table에 text sample {len(ti.samples)}개가 있음(혼합 파일) - fragmented "
+                     f"경로는 moof만 읽으므로 그 구간(앞부분)의 GPS가 누락됨")
+    except Exception as exc:  # noqa: BLE001
+        warn(f"moov sample table 확인 실패: {exc}")
 
     if args.track_id is not None:
         if args.track_id not in text_tracks:
@@ -2254,7 +2364,7 @@ def run_fragmented(f, filesize, out_dir, args):
 
 def run_sampletable(f, filesize, out_dir, args):
     """루트 B - GPS_metadata_mp4_pvc1_Atext.py 의 main과 동일한 호출 순서."""
-    top_boxes = list(iter_child_boxes(f, 0, filesize, context="top-level", allow_size_zero=True))
+    top_boxes = scan_top_level(f, filesize)
     moov_boxes = find_all(top_boxes, b"moov")
     if not moov_boxes:
         warn("moov Box를 찾지 못함")
@@ -2331,19 +2441,29 @@ def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
     첫 문장의 UTC가 0초. 자정을 넘어가면 하루(86400초)를 더해 이어붙인다."""
     base = None
     prev = None
+    prev_date = None
     carry = 0.0
     assigned = 0
+    leading_missing = 0   # UTC 없는 선두 문장 수(측위 전 V 문장 등). 첫 UTC 문장이 영상 0초가 아니다(리뷰 #9)
     for row in coord_rows:
         secs = _utc_to_seconds(row.get("utc_time"))
         if secs is None:
             row["start_time_sec"] = ""
             row["end_time_sec"] = ""
             row["time_source"] = ""
+            if base is None:
+                leading_missing += 1
             continue
+        # 체크섬이 깨진 문장은 시각으로 믿지 않는다: 그 값이 위로 튀면 이후 전 구간이 자정 넘김으로
+        # 오인돼 86400초가 더해졌다(리뷰 #55). 시간축 기준(prev/base)은 정상 문장으로만 세운다.
+        trusted_time = row.get("checksum_ok") is not False
+        date = row.get("date") or ""
         if prev is not None:
             drop = prev - (secs + carry)
-            if drop >= UTC_MIDNIGHT_MIN_DROP_SEC:
-                # 23:59:59 -> 00:00:00 처럼 하루가 통째로 되감긴 경우만 자정으로 본다.
+            date_advanced = bool(date and prev_date and date != prev_date and secs + carry < prev)
+            if drop >= UTC_MIDNIGHT_MIN_DROP_SEC or date_advanced:
+                # 23:59:59 -> 00:00:00 처럼 하루가 통째로 되감긴 경우(또는 날짜 필드가 바뀐 경우)만
+                # 자정으로 본다.
                 carry += 86400.0
             elif drop > 0:
                 # 같은 문장이 중복되거나 순서가 뒤바뀌면 몇 초쯤 뒤로 갈 수 있다.
@@ -2352,10 +2472,16 @@ def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
                 warn(f"GPS UTC가 {drop:.3f}초 뒤로 감 (utc_time={row.get('utc_time')!r}) "
                      f"- 자정 넘김이 아니라 중복/순서 뒤바뀜으로 보고 시간축을 그대로 둠")
         value = secs + carry
-        # 한 번 튄 값 때문에 이후 비교 기준이 낮아지지 않도록 최댓값을 유지한다.
-        prev = value if prev is None else max(prev, value)
+        if trusted_time:
+            # 한 번 튄 값 때문에 이후 비교 기준이 낮아지지 않도록 최댓값을 유지한다.
+            prev = value if prev is None else max(prev, value)
+            if date:
+                prev_date = date
         if base is None:
-            base = value
+            base = value - leading_missing * nominal_interval
+            if leading_missing:
+                warn(f"첫 {leading_missing}개 문장에 UTC가 없어 영상 0초를 '첫 UTC 시각 - "
+                     f"{leading_missing * nominal_interval:.0f}초'로 잡음")
         start = value - base
         row["start_time_sec"] = f"{start:.3f}"
         row["end_time_sec"] = f"{start + nominal_interval:.3f}"
@@ -2499,22 +2625,13 @@ def find_slack_regions(f, filesize):
     깨져서 더 못 가면 거기서 멈추고, 남은 뒷부분은 통째로 trailing 슬랙으로 본다.
     """
     regions = []
-    boxes = []
-    appended_at = None
-    pos = 0
-    while pos + 8 <= filesize:
-        box = read_box_header(f, pos, filesize, context="slack-scan", allow_size_zero=True)
-        if box is None:
-            break
-        # 두 번째 ftyp 부터는 옛 녹화 파일이 통째로 이어붙은 것이다(AVI의 appended_riff와 같은
-        # 경우). 그 뒤는 Box를 더 따라가지 않고 끝까지 슬랙으로 본다.
-        if box.box_type == b"ftyp" and pos > 0:
-            appended_at = pos
-            break
-        boxes.append(box)
-        if box.start > pos:
-            regions.append(("gap", pos, box.start))
-        pos = box.end
+    # 본 궤적과 같은 경계를 쓴다(scan_top_level_bounded). 경계 뒤가 이어붙은 옛 녹화(ftyp/tfdt)면
+    # 슬랙, 잘린 현재 Box(truncated)면 슬랙이 아니라 '잘림'이다 - 현재 녹화의 마지막 조각이 슬랙에
+    # 중복으로 들어가던 문제(리뷰 #34).
+    boxes, boundary, boundary_kind = scan_top_level_bounded(f, filesize)
+    appended_at = boundary if boundary_kind in ("ftyp", "tfdt") else None
+    truncated_at = boundary if boundary_kind == "truncated" else None
+    corrupt_at = boundary if boundary_kind == "corrupt" else None
 
     prev_end = 0
     for box in boxes:
@@ -2527,6 +2644,10 @@ def find_slack_regions(f, filesize):
 
     if appended_at is not None:
         regions.append(("appended_file", appended_at, filesize))
+    elif truncated_at is not None:
+        info(f"[슬랙] 0x{truncated_at:08X} 부터는 잘린 현재 녹화 Box - 슬랙으로 보지 않음")
+    elif corrupt_at is not None:
+        regions.append(("trailing", corrupt_at, filesize))
     elif prev_end < filesize:
         regions.append(("trailing", prev_end, filesize))
 
@@ -2626,13 +2747,21 @@ def run_slack_carve(f, filesize, out_dir, args):
         info(f"  [{kind}] 0x{s:08X} ~ 0x{e:08X}  ({e - s:,} bytes)")
 
     coord_rows, sensor_rows, region_stats = [], [], []
-    for kind, s, e in regions:
-        f.seek(s)
-        raw = f.read(e - s)
-        recs = carve_region(raw, 0, len(raw), kind)
+    # 영역을 통째로 read()하면 1.5GB 꼬리에 RSS가 그만큼 올라갔다(리뷰 #103). mmap으로 정규식을 돌린다.
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
+        for kind, s, e in regions:
+            _carve_one_region(mm, kind, s, e, coord_rows, sensor_rows, region_stats)
+    finally:
+        mm.close()
+    return _finish_slack_carve(regions, total, coord_rows, sensor_rows, region_stats, out_dir, args)
+
+
+def _carve_one_region(mm, kind, s, e, coord_rows, sensor_rows, region_stats):
+    if True:
+        recs = carve_region(mm, s, e, kind)
         n_gps = n_sen = 0
-        for rel_off, region_kind, rkind, payload, segment in recs:
-            off = s + rel_off
+        for off, region_kind, rkind, payload, segment in recs:
             if rkind == "gps_nmea":
                 coord_rows.append(build_slack_coord_row(off, region_kind, payload))
                 n_gps += 1
@@ -2643,6 +2772,8 @@ def run_slack_carve(f, filesize, out_dir, args):
                              "size_bytes": e - s, "gps_records": n_gps,
                              "gsensor_records": n_sen})
 
+
+def _finish_slack_carve(regions, total, coord_rows, sensor_rows, region_stats, out_dir, args):
     coord_rows.sort(key=lambda r: int(r["absolute_offset"], 16))
     sensor_rows.sort(key=lambda r: int(r["absolute_offset"], 16))
 
@@ -2691,6 +2822,22 @@ ROUTE_RUNNERS = {
 
 
 # ---- 여기부터: 이 파일 고유 - 파일 단위 처리 + CLI ----
+_USED_OUT_DIRS = set()
+
+
+def unique_out_dir(output_root, input_path):
+    """<output_root>/<stem>. Windows는 마지막 경로 요소의 끝 공백·점을 지워 'REC_F .mp4'의 폴더가 어긋나므로
+    걷어내고(리뷰 #65), 한 번에 처리하는 입력의 stem이 같으면 _2, _3을 붙인다(리뷰 #124)."""
+    stem = os.path.splitext(os.path.basename(input_path))[0].rstrip(" .") or "input"
+    base = os.path.join(output_root, stem)
+    out_dir, n = base, 1
+    while os.path.normcase(out_dir) in _USED_OUT_DIRS:
+        n += 1
+        out_dir = f"{base}_{n}"
+    _USED_OUT_DIRS.add(os.path.normcase(out_dir))
+    return out_dir
+
+
 def process_single_file(input_path, output_root, args):
     WARNINGS.clear()
     info("=" * 70)
@@ -2701,9 +2848,8 @@ def process_single_file(input_path, output_root, args):
         warn("파일 크기가 0바이트")
         return {"ok": False, "reason": "empty file", "route": None}
 
-    stem = os.path.splitext(os.path.basename(input_path))[0]
     # --probe-only 는 -o 없이도 돌 수 있어야 하므로 출력 경로 계산 자체를 미룬다.
-    out_dir = os.path.join(output_root, stem) if output_root is not None else None
+    out_dir = unique_out_dir(output_root, input_path) if output_root is not None else None
     # --dry-run / --probe-only 는 파일은 물론 폴더도 만들지 않는다.
     if out_dir is not None and not (args.dry_run or args.probe_only):
         os.makedirs(out_dir, exist_ok=True)
@@ -2719,7 +2865,19 @@ def process_single_file(input_path, output_root, args):
         route = probe["route"]
         if route is None:
             info(f"[SKIP] {input_path}: {probe['reason']}")
-            return {"ok": False, "reason": probe["reason"], "route": None, "probe": probe}
+            slack = None
+            if getattr(args, "slack", False) and out_dir is not None and not args.probe_only:
+                # moov가 없어 경로를 못 골라도 슬랙(옛 녹화 잔재)은 남아 있을 수 있다(리뷰 #57).
+                try:
+                    slack = run_slack_carve(f, filesize, out_dir, args)
+                except Exception as exc:
+                    warn(f"슬랙 카빙 중 예외: {exc}")
+                if not args.dry_run:
+                    with open(os.path.join(out_dir, "warnings.log"), "w", encoding="utf-8") as wf:
+                        for w_msg in WARNINGS:
+                            wf.write(w_msg + "\n")
+            return {"ok": False, "reason": probe["reason"], "route": None, "probe": probe,
+                    "slack": slack}
 
         runner, desc = ROUTE_RUNNERS[route]
         info(f"  -> 판별 결과: [{route}] {desc}")
@@ -2810,6 +2968,7 @@ def parse_args(argv):
 
 def main(argv=None):
     global DEBUG
+    _USED_OUT_DIRS.clear()
     args = parse_args(sys.argv[1:] if argv is None else argv)
     DEBUG = args.debug
     if not (args.dry_run or args.probe_only):

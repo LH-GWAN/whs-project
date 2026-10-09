@@ -1,6 +1,7 @@
 # ---- 여기부터: GPS_metadata_avi.py (RIFF/idx1 파서 + 스트림 선택/추출/디코딩) ----
 # ---- GPS_metadata_GPRMC.py 의 텍스트 스트림 사전 판정은 decide_stream_kind 다수결로 흡수됨 ----
 import argparse
+import bisect
 import csv
 import datetime
 import math
@@ -47,6 +48,37 @@ FLOAT_VECTOR_MAX_ABS = 50.0
 TRAILING_IGNORE_THRESHOLD = 16
 
 WARNINGS = []
+
+
+_CSV_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_guard(v):
+    """파일에서 읽은 문자열이 '='로 시작하면 Excel이 수식으로 실행한다(리뷰 #123). 숫자는 그대로 둔다."""
+    if isinstance(v, str) and v and v[0] in _CSV_FORMULA_PREFIX:
+        try:
+            float(v)
+            return v
+        except ValueError:
+            return "'" + v
+    return v
+
+
+class _GuardDictWriter(csv.DictWriter):
+    def _dict_to_list(self, rowdict):
+        return [_csv_guard(v) for v in super()._dict_to_list(rowdict)]
+
+
+class _GuardListWriter:
+    def __init__(self, writer):
+        self._writer = writer
+
+    def writerow(self, row):
+        self._writer.writerow([_csv_guard(v) for v in row])
+
+    def writerows(self, rows):
+        for row in rows:
+            self.writerow(row)
 
 
 def warn(msg):
@@ -109,10 +141,13 @@ def iter_chunks(mm, start, end, clamp_top_level=False):
         truncated = False
 
         if data_end > end:
-            if clamp_top_level and data_end <= filesize:
-                warn(f"top-level chunk {ck_id!r}@0x{pos:X} declared size가 부모 경계를 "
-                     f"넘어섬(end=0x{end:X}) - 파일 크기 기준으로 clamp")
-                data_end = min(data_end, filesize)
+            if clamp_top_level:
+                # 끝이 잘린 파일(주행 중 전원 차단 등): 선언 크기가 경계를 넘으면 경계까지만 읽는다.
+                # 예전 조건(data_end <= filesize)은 이 분기에서 절대 참이 될 수 없어 clamp가 한 번도
+                # 실행되지 않았고, 잘린 AVI는 구조 파싱 자체가 실패했다(리뷰 #10).
+                warn(f"chunk {ck_id!r}@0x{pos:X} declared size가 경계를 "
+                     f"넘어섬(end=0x{end:X}) - 경계 기준으로 clamp")
+                data_end = end
                 truncated = True
             else:
                 warn(f"chunk {ck_id!r}@0x{pos:X} size가 부모 경계(0x{end:X})를 넘어섬 - "
@@ -169,7 +204,8 @@ def find_top_level_sections(mm):
             continue
 
         movi_found_in_this_riff = False
-        for child in iter_chunks(mm, top.content_start, top.content_end):
+        # 잘린 RIFF 안의 마지막 자식(movi)도 경계까지만 읽는다.
+        for child in iter_chunks(mm, top.content_start, top.content_end, clamp_top_level=top.truncated):
             if child.is_list and child.list_type == b"hdrl" and hdrl is None and form_type == b"AVI ":
                 hdrl = child
             elif child.is_list and child.list_type == b"movi":
@@ -207,6 +243,12 @@ def find_idx1_fallback(mm):
                 warn("구조 파싱 실패, idx1 바이트 스캔(rfind) fallback 사용 "
                      f"(size 16배수 검증 통과, @0x{pos:X})")
                 return pos, size
+            if size % 16 == 0 and size > 0 and pos + 8 < filesize:
+                # 끝이 잘린 idx1: 남은 만큼(16바이트 단위)만 받는다(리뷰 #10).
+                usable = ((filesize - pos - 8) // 16) * 16
+                if usable > 0:
+                    warn(f"idx1 @0x{pos:X}가 파일 끝에서 잘림 - 남은 {usable}바이트만 사용")
+                    return pos, usable
         search_end = pos
         if search_end <= 0:
             return None
@@ -338,9 +380,20 @@ def resolve_targets(stream_table, select_mode, select_fcctypes, select_indices, 
 
     if select_mode == "auto_non_av":
         for s in stream_table:
-            if s.fcc_type not in STANDARD_AV_FCCTYPES:
-                s.selected = True
-                selected_chunk_ids |= s.observed_chunk_ids
+            if s.fcc_type in STANDARD_AV_FCCTYPES:
+                continue
+            ids = set(s.observed_chunk_ids)
+            if s.fcc_type is None:
+                # hdrl을 못 읽으면 타입을 모른다. 청크 ID 접미사가 표준 영상(dc/db)·오디오(wb)·팔레트(pc)면
+                # 그 스트림은 뺀다 - 예전엔 영상·오디오까지 통째로 두 벌 덤프했다(리뷰 #61).
+                av = {cid for cid in ids if cid[2:4] in (b"dc", b"db", b"wb", b"pc")}
+                if av:
+                    warn(f"stream {s.index}: hdrl 없이 청크 ID {sorted(av)!r}가 영상/오디오 규격이라 추출 대상에서 제외")
+                    ids -= av
+            if not ids:
+                continue
+            s.selected = True
+            selected_chunk_ids |= ids
         reason = "표준 vids/auds 를 제외한 모든 스트림"
     elif select_mode == "by_fcctype":
         for s in stream_table:
@@ -557,10 +610,20 @@ def decode_text_record(payload):
 
 
 def find_embedded_nmea_text(payload):
-    m = EMBEDDED_NMEA_RE.search(payload)
-    if not m:
+    """청크 안의 NMEA 문장 중 쓸 것 하나. 첫 매치만 쓰면 GGA→GSA→RMC 순서의 청크에서 속도·날짜가
+    사라졌다(리뷰 #53). RMC(속도·날짜·방위 포함)를 우선하고, 같은 종류 안에서는 checksum이 맞는
+    첫 문장을 고른다."""
+    cands = [m.group(1).decode("ascii", errors="replace") for m in EMBEDDED_NMEA_RE.finditer(payload)]
+    if not cands:
         return None
-    return m.group(1).decode("ascii", errors="replace")
+    for want in ("RMC", "GGA"):
+        typed = [c for c in cands if c[2:5] == want]
+        for c in typed:
+            if nmea_checksum_ok(c):
+                return c
+        if typed:
+            return typed[0]
+    return cands[0]
 
 
 def try_float_vector(payload):
@@ -869,8 +932,10 @@ def parse_finevu_record(payload, stream_fcc=None):
     """72바이트 고정 레코드를 해석한다. 형식이 아니면 None.
 
     반환 dict의 lat/lon/speed_kmh는 측위 실패 시 None이다. 0으로 채우지 않는다."""
-    if len(payload) < FINEVU_RECORD_MIN_LEN:
-        return None
+    if not (FINEVU_RECORD_MIN_LEN <= len(payload) <= FINEVU_RECORD_LEN + 8):
+        return None   # 72바이트 레코드다. 긴 청크의 앞부분만 보고 인정하지 않는다(리뷰 #50)
+    if not any(payload[:FINEVU_RECORD_LEN]):
+        return None   # 0으로 채운 청크는 레코드가 아니다 - 가짜 0g가 생겼다(리뷰 #50)
 
     try:
         gx, gy, gz, hemi, speed, lat_raw, lon_raw = struct.unpack_from(
@@ -942,7 +1007,9 @@ def parse_finevu_record(payload, stream_fcc=None):
         "coord_format": "decimal(dats)" if decimal_coords else "ddmm(txts)",
         "elapsed_sec": elapsed,
         "parse_warnings": ";".join(sorted(set(parse_warnings))),
-        "trusted": bool(not no_fix and not parse_warnings),
+        # 신뢰도는 GPS 쪽 근거(측위 실패·반구 플래그)로만 정한다. G센서 센티넬(99/100)은 센서 결측일 뿐
+        # 좌표와 무관한데, 예전엔 경고가 하나라도 있으면 GPS까지 불신해 정상 좌표가 전부 빠졌다(리뷰 #5).
+        "trusted": bool(not no_fix and "unexpected_hemisphere_flag" not in parse_warnings),
         "raw": payload[:FINEVU_RECORD_LEN].hex(),
     }
 
@@ -1022,6 +1089,19 @@ def compute_video_duration(mm, hdrl_chunk, stream_table):
                 if usec and frames:
                     return frames * usec / 1e6, f"avih({1e6/usec:.3f}fps x {frames}프레임)"
     return None, "영상 스트림 strh와 avih 어디서도 재생 길이를 구할 수 없음"
+
+
+def first_riff_video_duration(stream_table, idx1_entries):
+    """OpenDML(AVIX가 이어지는) 파일에서 idx1이 가리키는 첫 RIFF만의 영상 길이. strh dwLength는 전체
+    프레임 수라 첫 RIFF idx1의 레코드 수로 나누면 시간축이 늘어났다(리뷰 #51). 못 구하면 None."""
+    for s in stream_table:
+        if s.fcc_type != b"vids" or not (s.dw_rate and s.dw_scale):
+            continue
+        fps = s.dw_rate / s.dw_scale
+        frames = sum(1 for e in idx1_entries if stream_index_from_chunk_id(e["chunk_id"]) == s.index)
+        if fps > 0 and frames:
+            return frames / fps, f"첫 RIFF idx1 영상 프레임 {frames}개 / {fps:.3f}fps (OpenDML)"
+    return None
 
 
 def build_avi_stream_times(video_duration, record_count):
@@ -1272,13 +1352,13 @@ def save_metadata(out_dir, index_rows, stream_table, labels, dry_run=False):
         "validation", "output_file",
     ]
     with open(index_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = _GuardDictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(index_rows)
 
     stream_csv = os.path.join(out_dir, "stream_table.csv")
     with open(stream_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+        w = _GuardListWriter(csv.writer(f))
         w.writerow(["stream_index", "fcc_type", "fcc_handler", "strn_name",
                     "observed_chunk_ids", "role", "selected"])
         for s in stream_table:
@@ -1315,7 +1395,8 @@ def decide_stream_kind(counts, min_fraction=DECODE_MIN_FRACTION):
     return None
 
 
-def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_run=False):
+def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_run=False,
+                       decode_summary=None):
     """GPS 스트림과 센서 스트림을 재생 시각 기준으로 한 줄에 합친 통합 타임라인.
     AVI는 GPS와 G센서가 서로 다른 스트림(예: GPSR/SENS)에 들어있어서, 각 스트림에
     이미 계산해둔 start_time_sec로 붙인다. 루트 A/B/C의 timeline.csv와 컬럼 구성을
@@ -1329,21 +1410,47 @@ def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_ru
     coord_by_stream = extract_result["coord_rows_by_stream"]
     sensor_by_stream = extract_result["sensor_rows_by_stream"]
 
+    def decoded(s):
+        # 다수결(decide_stream_kind)에 못 미친 스트림은 coordinates.csv도 없는데 timeline에는 실려
+        # 신뢰도 정보 없이 유효 측위가 됐다(리뷰 #49). 판정된 스트림만 쓴다.
+        if decode_summary is None:
+            return True
+        return decode_summary.get(s.index, {}).get("kind") in ("text", "record72")
+
     gps_rows = []
     for s in selected_streams:
+        if not decoded(s):
+            continue
         rows = [r for r in coord_by_stream.get(s.index, []) if r.get("start_time_sec")]
         if len(rows) > len(gps_rows):
             gps_rows = rows
     if not gps_rows:
         return None
 
-    # 센서는 재생 시각(ms 단위 반올림)으로 찾는다. 같은 시각이 여러 개면 첫 번째를 쓴다.
-    sensor_at = {}
+    # 센서는 가장 가까운 재생 시각으로 붙인다. 스트림마다 따로 만든 균등 격자를 '%.3f' 문자열로 완전
+    # 일치시키면 레코드 수가 하나만 달라도 G값이 거의 다 빠졌다(리뷰 #54).
+    sensor_times = []
     for s in selected_streams:
         for r in sensor_by_stream.get(s.index, []):
-            key = r.get("start_time_sec")
-            if key and key not in sensor_at:
-                sensor_at[key] = r
+            try:
+                sensor_times.append((float(r.get("start_time_sec")), r))
+            except (TypeError, ValueError):
+                continue
+    sensor_times.sort(key=lambda x: x[0])
+    sensor_keys = [t for t, _ in sensor_times]
+
+    def sensor_near(key, tolerance=1.0):
+        try:
+            t = float(key)
+        except (TypeError, ValueError):
+            return {}
+        k = bisect.bisect_left(sensor_keys, t)
+        best = None
+        for j in (k - 1, k):
+            if 0 <= j < len(sensor_keys) and abs(sensor_keys[j] - t) <= tolerance:
+                if best is None or abs(sensor_keys[j] - t) < abs(sensor_keys[best] - t):
+                    best = j
+        return sensor_times[best][1] if best is not None else {}
 
     rows = []
     last_lat = last_lon = last_speed = ""
@@ -1351,7 +1458,7 @@ def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_ru
         if r.get("latitude"):
             last_lat, last_lon = r["latitude"], r["longitude"]
             last_speed = r.get("speed_kmh", "")
-        sen = sensor_at.get(r.get("start_time_sec"), {})
+        sen = sensor_near(r.get("start_time_sec"))
         rows.append({
             "sample": i,
             "start_time_sec": r.get("start_time_sec", ""),
@@ -1365,6 +1472,11 @@ def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_ru
             "gps_date": r.get("date", ""),
             "gps_utc_time": r.get("utc_time", ""),
             "gps_checksum_ok": r.get("checksum_ok", ""),
+            "gps_trusted": r.get("trusted", ""),   # status=V·파싱 경고 행을 앱이 유효 측위로 보지 않게(리뷰 #49)
+            # UTC가 없는 기기(FineVu 72바이트 레코드)도 측위 상태(A/V)와 레코드 순번(경과 초)을 남긴다 -
+            # 앱이 측위 실패 행을 '수신 끊김'으로 구분하고 정차 중 같은 값을 다른 측정으로 세게(리뷰 #6, #7).
+            "gps_status": r.get("status", ""),
+            "gps_elapsed_sec": r.get("elapsed_delta_sec", ""),
             "latitude_last": last_lat,
             "longitude_last": last_lon,
             "speed_kmh_last": last_speed,
@@ -1374,7 +1486,7 @@ def write_avi_timeline(out_dir, selected_streams, labels, extract_result, dry_ru
 
     path = os.path.join(out_dir, "timeline.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = _GuardDictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
     return len(rows)
@@ -1433,7 +1545,7 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
                     "mode", "checksum_ok", "status_valid", "trusted", "parse_warnings",
                     "sequence", "idx1_entry_offset", "chunk_id", "sentence_type", "raw_sentence",
                 ]
-                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w = _GuardDictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(coord_rows)
 
@@ -1456,7 +1568,7 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
 
             with open(os.path.join(stream_dir, "coordinates.csv"), "w", newline="",
                        encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=RECORD72_COORD_FIELDS)
+                w = _GuardDictWriter(f, fieldnames=RECORD72_COORD_FIELDS, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(coord_rows)
 
@@ -1467,7 +1579,7 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
 
             with open(os.path.join(stream_dir, "sensor_values.csv"), "w", newline="",
                        encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=RECORD72_SENSOR_FIELDS)
+                w = _GuardDictWriter(f, fieldnames=RECORD72_SENSOR_FIELDS, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(sensor_rows)
 
@@ -1489,14 +1601,14 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
             fieldnames = ["start_time_sec", "end_time_sec", "time_source",
                           "sequence", "idx1_entry_offset", "chunk_id", "vector_length"] + all_value_fields
             with open(sensor_csv, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                w = _GuardDictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(sensor_rows)
 
     decode_detect_csv = os.path.join(out_dir, "decode_detection.csv")
     if not dry_run:
         with open(decode_detect_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+            w = _GuardListWriter(csv.writer(f))
             w.writerow(["stream_index", "nmea_text", "generic_text", "record72",
                         "float_vector", "binary", "decision"])
             for s in selected_streams:
@@ -1613,7 +1725,9 @@ def sniff_embedded_filename(mm, riff_pos, search_window=0x400):
 
 def count_top_level_riffs(mm):
     """최상위에서 연속으로 이어지는 유효한 RIFF 청크 개수를 선언된 크기만
-    따라가며 센다(문자열 검색 아님)."""
+    따라가며 센다(문자열 검색 아님). 선언 크기가 0이거나 파일을 넘는 RIFF(미종결·헤더 손상)는
+    세지 않고 거기서 멈춘다 - 예전엔 크기 0을 유효한 빈 RIFF로 세서 파일 전체가 트레일링이
+    됐다(리뷰 #52)."""
     filesize = len(mm)
     pos = 0
     count = 0
@@ -1622,11 +1736,47 @@ def count_top_level_riffs(mm):
             break
         size = struct.unpack_from("<I", mm, pos + 4)[0]
         end = pos + 8 + size
-        if end > filesize:
+        if size < 4 or end > filesize:
             break
         count += 1
         pos = end + (size & 1)
     return count, pos
+
+
+def current_recording_end(mm):
+    """현재 녹화분이 끝나는 위치와 상태. 반환값: (end_pos, status)
+      status "ok"        첫 RIFF('AVI ')와 그 뒤에 이어지는 OpenDML AVIX RIFF까지가 현재 녹화
+             "invalid"   첫 RIFF 선언 크기가 0이거나 파일을 넘음(미종결·헤더 손상) - 경계를 알 수 없음
+    AVIX는 같은 녹화의 연속 구간이라 슬랙이 아니다(리뷰 #11). 뒤에 오는 'AVI ' RIFF나 미상 데이터가
+    슬랙이다."""
+    filesize = len(mm)
+    if filesize < 12 or bytes(mm[0:4]) != b"RIFF":
+        return filesize, "invalid"
+    size = struct.unpack_from("<I", mm, 4)[0]
+    end = 8 + size
+    if size < 4 or end > filesize:
+        return filesize, "invalid"
+    # 선언 크기가 실제 구조보다 작은 경우(기록 중간의 헤더 값이 남은 미종결 파일): idx1이 선언한 끝
+    # 너머에 있으면 경계를 믿을 수 없다. 그대로 두면 현재 녹화의 뒷부분이 슬랙으로 중복된다.
+    try:
+        _hdrl, _movi, idx1, _avix = find_top_level_sections(mm)
+        if idx1 is not None:
+            idx1_end = idx1.data_start + idx1.ck_size
+        else:
+            fb = find_idx1_fallback(mm)
+            idx1_end = fb[0] + 8 + fb[1] if fb is not None else 0
+        if idx1_end > end + 1:
+            return filesize, "invalid"
+    except Exception:  # noqa: BLE001
+        pass
+    pos = end + (size & 1)
+    while pos + 12 <= filesize and bytes(mm[pos:pos + 4]) == b"RIFF" and bytes(mm[pos + 8:pos + 12]) == b"AVIX":
+        size = struct.unpack_from("<I", mm, pos + 4)[0]
+        end = pos + 8 + size
+        if size < 4 or end > filesize:
+            return filesize, "ok"   # 잘린 AVIX: 현재 녹화가 파일 끝까지라고 본다(슬랙 아님)
+        pos = end + (size & 1)
+    return pos, "ok"
 
 
 def analyze_slack(mm):
@@ -1759,7 +1909,10 @@ def save_unknown_trailing_blob(mm, first_end, trailing, tag, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "trailing_unknown_data.bin")
     with open(out_path, "wb") as f:
-        f.write(bytes(mm[first_end:first_end + trailing]))
+        pos, end = first_end, first_end + trailing
+        while pos < end:   # 수 GB 꼬리도 통째로 메모리에 올리지 않는다(리뷰 #52)
+            f.write(mm[pos:min(pos + 8 * 1024 * 1024, end)])
+            pos += 8 * 1024 * 1024
     note_path = os.path.join(out_dir, "trailing_unknown_data.README.txt")
     tag_disp = tag.decode("ascii", errors="replace")
     with open(note_path, "w", encoding="utf-8") as f:
@@ -1798,16 +1951,14 @@ def slack_regions_avi(mm, analysis=None):
         start = min(e["pos"] for e in embedded)
         if movi.content_end > start:
             regions.append(("embedded", start, movi.content_end))
-    # 첫 번째 최상위 RIFF가 선언한 크기 뒤는 전부 슬랙이다 - 미상 꼬리든, 온전한 RIFF(옛 녹화 파일)가
-    # 통째로 이어붙어 있든 마찬가지다(count_top_level_riffs는 뒤의 RIFF를 정상 파일로 세므로 거기에
-    # 기대면 이 경우를 놓친다).
+    # 현재 녹화분(첫 RIFF + 이어지는 OpenDML AVIX)이 끝난 뒤는 전부 슬랙이다 - 미상 꼬리든, 온전한
+    # RIFF(옛 녹화 파일)가 통째로 이어붙어 있든 마찬가지다. 첫 RIFF의 선언 크기가 비정상이면
+    # (미종결·헤더 손상) 경계를 모르니 트레일링 판정을 생략한다(리뷰 #11, #52).
     filesize = len(mm)
-    if filesize >= 12 and bytes(mm[0:4]) == b"RIFF":
-        first_end = 8 + struct.unpack_from("<I", mm, 4)[0]
-        first_end += first_end & 1
-        if first_end < filesize - TRAILING_IGNORE_THRESHOLD:
-            kind = "appended_riff" if bytes(mm[first_end:first_end + 4]) == b"RIFF" else "trailing"
-            regions.append((kind, first_end, filesize))
+    end, status = current_recording_end(mm)
+    if status == "ok" and end < filesize - TRAILING_IGNORE_THRESHOLD:
+        kind = "appended_riff" if bytes(mm[end:end + 4]) == b"RIFF" else "trailing"
+        regions.append((kind, end, filesize))
     return regions
 
 
@@ -1903,7 +2054,7 @@ def _write_dict_csv(path, rows):
             if k not in fieldnames:
                 fieldnames.append(k)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = _GuardDictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
 
@@ -1936,6 +2087,10 @@ def handle_slack(input_path, mm, out_dir, dry_run=False, repair=False):
              f"{'/'.join(reasons)})"
              + (f" - 파일명 흔적: {fname!r}" if fname else ""))
 
+    if top_count == 0:
+        info("[슬랙 판단] 첫 RIFF의 선언 크기가 비정상(0이거나 파일을 넘음) - 미종결·헤더 손상으로 보고 "
+             "트레일링 판정을 생략함")
+        extra_after = 0
     if extra_after >= TRAILING_IGNORE_THRESHOLD:
         tail_tag = bytes(mm[extra_after_pos:extra_after_pos + 4])
         if tail_tag == b"RIFF" and top_count >= 2:
@@ -1979,6 +2134,22 @@ def handle_slack(input_path, mm, out_dir, dry_run=False, repair=False):
 
 
 # ---- 여기부터: 이 파일 고유 - 파일 단위 처리 + CLI ----
+_USED_OUT_DIRS = set()
+
+
+def unique_out_dir(output_root, input_path):
+    """<output_root>/<stem>. Windows는 마지막 경로 요소의 끝 공백·점을 지워 'REC_F .avi'의 폴더가 어긋나므로
+    걷어내고(리뷰 #65), 한 번에 처리하는 입력의 stem이 같으면 _2, _3을 붙인다(리뷰 #124)."""
+    stem = os.path.splitext(os.path.basename(input_path))[0].rstrip(" .") or "input"
+    base = os.path.join(output_root, stem)
+    out_dir, n = base, 1
+    while os.path.normcase(out_dir) in _USED_OUT_DIRS:
+        n += 1
+        out_dir = f"{base}_{n}"
+    _USED_OUT_DIRS.add(os.path.normcase(out_dir))
+    return out_dir
+
+
 def process_single_file(input_path, output_root, args):
     WARNINGS.clear()
     assert_riff_file(input_path)
@@ -1988,8 +2159,7 @@ def process_single_file(input_path, output_root, args):
         warn(f"{input_path}: 입력 파일 크기가 0입니다 - 건너뜀")
         return
 
-    stem = os.path.splitext(os.path.basename(input_path))[0]
-    out_dir = os.path.join(output_root, stem)
+    out_dir = unique_out_dir(output_root, input_path)
     if not args.dry_run:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -2066,6 +2236,10 @@ def process_single_file(input_path, output_root, args):
         # 재생 시간축: 텍스트 스트림 strh가 깨져 있는 기기가 많아 영상 스트림 길이를
         # 레코드 수로 나눠 균등 간격을 만든다(자세한 근거는 compute_video_duration 참고).
         video_duration, duration_source = compute_video_duration(mm, hdrl, stream_table)
+        if avix_count and video_duration:
+            first = first_riff_video_duration(stream_table, idx1_entries)
+            if first is not None and first[0] < video_duration:
+                video_duration, duration_source = first
         if video_duration:
             info(f"[시간축] 영상 길이 {video_duration:.3f}초 ({duration_source})")
         else:
@@ -2099,7 +2273,7 @@ def process_single_file(input_path, output_root, args):
 
         # GPS/센서를 재생 시각 기준 한 줄로 합친 통합 타임라인(시각화용).
         n_timeline = write_avi_timeline(out_dir, selected_streams, result["labels"],
-                                         result, dry_run=args.dry_run)
+                                         result, dry_run=args.dry_run, decode_summary=decode_summary)
         if n_timeline:
             info(f"[시간축] timeline.csv {n_timeline}행 생성")
 
@@ -2166,6 +2340,7 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    _USED_OUT_DIRS.clear()
     if not args.dry_run:
         os.makedirs(args.output, exist_ok=True)
 
