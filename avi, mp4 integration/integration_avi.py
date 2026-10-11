@@ -219,6 +219,14 @@ def find_top_level_sections(mm):
             elif (not child.is_list) and child.ck_id == b"idx1" and idx1 is None and form_type == b"AVI ":
                 idx1 = child
 
+    if idx1 is not None and movi_list:
+        # 사전 할당 파일은 RIFF 선언 크기가 계획값이라 옛 녹화의 idx1까지 구조 안에 들어온다. 현재 movi의
+        # 첫 청크들과 맞물리는 색인만 받는다 - 옛 idx1을 쓰면 옛 GPS가 현재 궤적으로 나온다(리뷰 #7).
+        usable = min(idx1.ck_size, max(0, filesize - idx1.data_start)) // 16 * 16
+        base = _idx1_entries_plausible(mm, idx1.pos, usable, chain_start=movi_list[0].content_start) if usable else None
+        if base is None:
+            warn(f"idx1 @0x{idx1.pos:X}가 현재 movi의 청크와 맞지 않음(옛 녹화 잔재 또는 손상) - 색인으로 쓰지 않음")
+            idx1 = None
     return hdrl, movi_list, idx1, avix_count
 
 
@@ -243,50 +251,100 @@ def _scan_list(mm, list_type, start=0, limit=None):
         pos += 4
 
 
+def _count_avix_after(mm, pos):
+    """pos부터 'RIFF....AVIX'가 선언 크기대로 이어지는 개수(시그니처 손상 파일용 - 머리부터 걸을 수 없다)."""
+    filesize = len(mm)
+    count = 0
+    while pos + 12 <= filesize and bytes(mm[pos:pos + 4]) == b"RIFF" and bytes(mm[pos + 8:pos + 12]) == b"AVIX":
+        size = struct.unpack_from("<I", mm, pos + 4)[0]
+        count += 1
+        if size < 4 or pos + 8 + size > filesize:
+            break
+        pos = pos + 8 + size + (size & 1)
+    return count
+
+
 def find_top_level_sections_damaged(mm):
-    """RIFF 머리가 없는(앞부분 손상) 파일: hdrl·movi·idx1을 각각 바이트 스캔으로 찾는다. 손상 파일 복구용."""
-    hdrl = _scan_list(mm, b"hdrl", 0, 4 * 1024 * 1024)
+    """RIFF 머리가 없는(앞부분 손상) 파일: hdrl·movi·idx1을 각각 바이트 스캔으로 찾는다. 손상 파일 복구용.
+    기준점은 '현재 녹화의 첫 청크 사슬'(first_chunk_chain)이다. 사전 할당 파일 뒤쪽의 옛 녹화 잔재
+    (옛 RIFF/hdrl/movi/idx1)가 현재 녹화로 섞이지 않게, hdrl은 movi보다 앞에 있는 것만, idx1은 현재
+    movi 시작과 맞물리는 것만 인정한다(리뷰 #7, #9)."""
+    filesize = len(mm)
+    chain = first_chunk_chain(mm)
     idx1 = None
     base = None
-    fb = find_idx1_fallback(mm)
+    fb = find_idx1_fallback(mm, chain_start=chain)
     if fb is not None:
         pos, size = fb
         idx1 = ChunkInfo(ck_id=b"idx1", ck_size=size, pos=pos, data_start=pos + 8,
-                         data_end=min(pos + 8 + size, len(mm)), is_list=False)
-        base = _idx1_entries_plausible(mm, pos, size)
+                         data_end=min(pos + 8 + size, filesize), is_list=False)
+        base = _idx1_entries_plausible(mm, pos, size, chain_start=chain)
+    movi = None
     if base is not None and base > 0:
         # 'LIST....movi' 머리가 0으로 덮였어도 idx1 엔트리가 가리키는 기준점이 movi FourCC 위치다.
         # 바이트 스캔으로 잡은 'movi' 문자열은 옛 녹화 잔재(슬랙)일 수 있어 믿지 않는다.
+        content_start = chain if (chain is not None and base <= chain <= base + 8) else base + 4
         movi = ChunkInfo(ck_id=b"LIST", ck_size=idx1.pos - base - 4, pos=base - 8, data_start=base,
                          data_end=idx1.pos, is_list=True, list_type=b"movi",
-                         content_start=base + 4, content_end=idx1.pos)
+                         content_start=content_start, content_end=idx1.pos)
         warn(f"movi 머리를 idx1 엔트리 역산으로 복원: FourCC 위치 0x{base:X}")
-    else:
-        movi = _scan_list(mm, b"movi", (hdrl.data_end if hdrl else 0))
-        if movi is not None and _chunk_header_ok(mm, movi.content_start, len(mm)) is None:
-            # 찾은 'movi' 뒤에 청크 머리가 없으면 옛 녹화 잔재다 - 더 뒤를 찾는다.
-            alt = _scan_list(mm, b"movi", movi.pos + 12)
-            while alt is not None and _chunk_header_ok(mm, alt.content_start, len(mm)) is None:
-                alt = _scan_list(mm, b"movi", alt.pos + 12)
-            movi = alt or movi
-        if movi is not None and idx1 is not None and movi.data_end > idx1.pos:
-            # 선언 크기를 믿을 수 없으면 idx1 앞까지만 movi로 본다.
-            movi.data_end = movi.content_end = idx1.pos
+    elif chain is not None:
+        movi_end = idx1.pos if (idx1 is not None and idx1.pos > chain) else filesize
+        if chain >= 12 and bytes(mm[chain - 12:chain - 8]) == b"LIST" and bytes(mm[chain - 4:chain]) == b"movi":
+            ck_size = struct.unpack_from("<I", mm, chain - 8)[0]
+            declared_end = chain - 4 + ck_size
+            if 4 <= ck_size and declared_end <= movi_end:
+                movi_end = declared_end
+            movi = ChunkInfo(ck_id=b"LIST", ck_size=ck_size, pos=chain - 12, data_start=chain - 4,
+                             data_end=movi_end, is_list=True, list_type=b"movi",
+                             content_start=chain, content_end=movi_end,
+                             truncated=declared_end > filesize)
+        else:
+            # movi 머리까지 지워진 파일: 첫 청크 사슬 바로 앞을 가상 FourCC 위치로 둔다(색인 재구성용 base).
+            movi = ChunkInfo(ck_id=b"LIST", ck_size=movi_end - (chain - 4), pos=chain - 12, data_start=chain - 4,
+                             data_end=movi_end, is_list=True, list_type=b"movi",
+                             content_start=chain, content_end=movi_end)
+            warn(f"movi 머리 소실 - 첫 청크 사슬 0x{chain:X}을 현재 녹화 데이터의 시작으로 봄")
+    # hdrl은 현재 movi보다 앞에 있어야 한다. movi 안에서 RIFF와 함께 나오는 hdrl은 옛 녹화 잔재다(리뷰 #9).
+    hdrl_limit = movi.pos if movi is not None else 4 * 1024 * 1024
+    hdrl = _scan_list(mm, b"hdrl", 0, max(hdrl_limit, 0)) if hdrl_limit > 0 else None
+    if hdrl is None and movi is not None and mm.find(b"hdrl", movi.content_start) >= 0:
+        warn("movi 뒤(옛 녹화 잔재)에서만 hdrl이 발견됨 - 현재 녹화의 헤더로 쓰지 않음(헤더 소실)")
+    avix = 0
+    if idx1 is not None:
+        avix = _count_avix_after(mm, idx1.data_end + (idx1.ck_size & 1))
+    elif movi is not None and movi.data_end < filesize:
+        avix = _count_avix_after(mm, movi.data_end + (movi.ck_size & 1))
     warn(f"손상 파일 구조 탐색: hdrl={'있음' if hdrl else '없음'}, movi={'있음' if movi else '없음'}, "
-         f"idx1={'있음' if idx1 else '없음'}")
-    return hdrl, ([movi] if movi else []), idx1, 0
+         f"idx1={'있음' if idx1 else '없음'}" + (f", AVIX {avix}개" if avix else ""))
+    return hdrl, ([movi] if movi else []), idx1, avix
 
 
-CHUNK_ID_RE = re.compile(rb"[0-9]{2}(?:dc|db|wb|tx|st|pc|ix)|JUNK")
+# 스트림 청크 id(NNdc/NNwb/NNtx…)와 OpenDML 표준 색인(ixNN). JUNK·'LIST....rec '는 정상 구조라 걷기에서
+# 통과시키되 색인 엔트리로는 만들지 않는다(리뷰 #16).
+STREAM_CHUNK_ID_RE = re.compile(rb"[0-9]{2}(?:dc|db|wb|tx|st|pc|ix)|ix[0-9]{2}")
+CHUNK_ID_RE = re.compile(rb"[0-9]{2}(?:dc|db|wb|tx|st|pc|ix)|ix[0-9]{2}|JUNK")
+_RESYNC_RE = re.compile(rb"[0-9]{2}(?:dc|db|wb|tx|st|pc|ix)|ix[0-9]{2}|JUNK|LIST")
 MAX_CHUNK_BYTES = 64 * 1024 * 1024
 DAMAGE_GAPS = []   # [(start, end)] movi 안에서 청크 머리를 읽을 수 없어 건너뛴 바이트 구간(파일 절대 위치)
+# 마지막 색인 재구성(synthesize_idx1)의 판정 근거. process_single_file이 DAMAGE_JSON으로 앱에 넘긴다.
+SYNTH_INFO = {}
+ZERO_TAIL_PROBE = 64 * 1024
 
 
 def _chunk_header_ok(mm, pos, end):
-    """pos에 그럴듯한 청크 머리가 있는가. 있으면 (id, size), 없으면 None."""
+    """pos에 그럴듯한 청크 머리가 있는가. 있으면 (id, size), 없으면 None.
+    'LIST....rec '(OpenDML 레코드 그룹)도 머리로 인정한다 - 걷기는 그 안으로 들어간다."""
     if pos + 8 > end:
         return None
     ck_id = bytes(mm[pos:pos + 4])
+    if ck_id == b"LIST":
+        if pos + 12 > end or bytes(mm[pos + 8:pos + 12]) != b"rec ":
+            return None
+        size = struct.unpack_from("<I", mm, pos + 4)[0]
+        if size < 4 or size > MAX_CHUNK_BYTES or pos + 8 + size > end:
+            return None
+        return ck_id, size
     if not CHUNK_ID_RE.fullmatch(ck_id):
         return None
     size = struct.unpack_from("<I", mm, pos + 4)[0]
@@ -295,10 +353,72 @@ def _chunk_header_ok(mm, pos, end):
     return ck_id, size
 
 
-def walk_movi_chunks(mm, start, end, gaps=None):
+def _next_header_ok(mm, nxt, end):
+    """nxt(또는 패딩 1바이트 뒤)에 머리가 있는가 - 재동기화 후보가 진짜인지 확인용."""
+    if nxt >= end:
+        return True
+    if _chunk_header_ok(mm, nxt, end) is not None:
+        return True
+    return bytes(mm[nxt:nxt + 1]) == b"\0" and _chunk_header_ok(mm, nxt + 1, end) is not None
+
+
+def _is_zero_region(mm, start, end, block=1024 * 1024):
+    """[start, end)가 전부 0인가(블록 단위 비교)."""
+    pos = start
+    zero = bytes(block)
+    while pos < end:
+        n = min(block, end - pos)
+        if bytes(mm[pos:pos + n]) != zero[:n]:
+            return False
+        pos += n
+    return True
+
+
+def _zero_fraction(mm, start, end, block=1024 * 1024):
+    """[start, end)에서 0 바이트의 비율. 0으로 덮인 손상 구간은 양끝에 잘린 청크의 꼬리가 조금 남는다."""
+    if end <= start:
+        return 0.0
+    zeros = 0
+    pos = start
+    while pos < end:
+        n = min(block, end - pos)
+        zeros += bytes(mm[pos:pos + n]).count(0)
+        pos += n
+    return zeros / (end - start)
+
+
+ZERO_GAP_MIN_FRACTION = 0.5
+ZERO_GAP_PROBE = 4096
+
+
+def first_chunk_chain(mm, start=0, end=None, max_scan=None):
+    """start부터 스트림 청크 머리 두 개가 연달아 맞는 첫 위치. 현재 녹화의 movi 내용이 시작하는 자리로,
+    'LIST....movi' 머리가 지워진 파일에서도 잡힌다. JUNK·LIST는 사슬의 시작으로 치지 않는다(hdrl 뒤
+    JUNK 패딩이 movi 앞에 오는 정상 구조). 없으면 None."""
+    end = len(mm) if end is None else min(end, len(mm))
+    limit = end if max_scan is None else min(end, start + max_scan)
+    scan = start
+    while scan + 8 <= limit:
+        m = STREAM_CHUNK_ID_RE.search(mm, scan, limit)
+        if m is None:
+            return None
+        cand = m.start()
+        h = _chunk_header_ok(mm, cand, end)
+        if h is not None:
+            nxt = cand + 8 + h[1] + (h[1] & 1)
+            if nxt < end and _next_header_ok(mm, nxt, end):
+                return cand
+        scan = cand + 1
+    return None
+
+
+def walk_movi_chunks(mm, start, end, gaps=None, tail_info=None):
     """movi 영역을 청크 머리로 순서대로 걷는다. idx1 없이 색인을 다시 만들거나(녹화 중단) 0으로 덮인
     구간을 건너뛰기 위한 것. 읽을 수 없는 머리를 만나면 다음 그럴듯한 머리(그 다음 머리까지 맞아야 함)를
-    찾아 재동기화하고 건너뛴 구간을 gaps에 남긴다. yield (pos, ck_id, size)."""
+    찾아 재동기화하고 건너뛴 구간을 gaps에 남긴다. yield (pos, ck_id, size).
+    'LIST....rec ' 그룹은 안으로 들어가 걷고(그룹 머리는 yield하지 않음), 마지막 청크 뒤의 0 꼬리(사전
+    할당의 미사용 영역)와 파일 끝에서 잘린 마지막 청크는 손상 구간(gaps)이 아니라 tail_info에 남긴다
+    (리뷰 #11, #16): tail_info["zero_tail"]=(pos, end), tail_info["truncated_tail"]=pos."""
     pos = start
     while pos + 8 <= end:
         head = _chunk_header_ok(mm, pos, end)
@@ -310,21 +430,33 @@ def walk_movi_chunks(mm, start, end, gaps=None):
             found = None
             scan = pos + 1
             while scan + 8 <= end:
-                m = CHUNK_ID_RE.search(mm, scan, min(end, scan + 4 * 1024 * 1024))
+                m = _RESYNC_RE.search(mm, scan, min(end, scan + 4 * 1024 * 1024))
                 if m is None:
                     scan = min(end, scan + 4 * 1024 * 1024 - 8)
                     continue
                 cand = m.start()
                 h = _chunk_header_ok(mm, cand, end)
                 if h is not None:
-                    nxt = cand + 8 + h[1] + (h[1] & 1)
-                    if nxt >= end or _chunk_header_ok(mm, nxt, end) is not None \
-                            or (bytes(mm[nxt:nxt + 1]) == b"\0" and _chunk_header_ok(mm, nxt + 1, end)):
+                    nxt = cand + 12 if h[0] == b"LIST" else cand + 8 + h[1] + (h[1] & 1)
+                    if _next_header_ok(mm, nxt, end):
                         found = cand
                         break
                 scan = cand + 1
             if found is None:
-                if gaps is not None:
+                ck_id = bytes(mm[pos:pos + 4])
+                if end >= len(mm) and STREAM_CHUNK_ID_RE.fullmatch(ck_id) \
+                        and pos + 8 + struct.unpack_from("<I", mm, pos + 4)[0] > end:
+                    # 파일 끝에서 잘린 마지막 청크(전원 차단) - 손상 구간이 아니라 절단이다.
+                    if tail_info is not None:
+                        tail_info["truncated_tail"] = pos
+                    warn(f"movi @0x{pos:X}: 마지막 청크 {ck_id!r}가 파일 끝에서 잘림")
+                elif _is_zero_region(mm, pos, min(end, pos + ZERO_TAIL_PROBE)):
+                    # 마지막 실제 청크 뒤의 0 꼬리: 사전 할당 파일의 미사용 영역이지 손상이 아니다. 빈 자리를
+                    # 넣으면 실제 기록이 앞으로 몰려 시간축이 압축된다(리뷰 #11).
+                    if tail_info is not None:
+                        tail_info["zero_tail"] = (pos, end)
+                    warn(f"movi @0x{pos:X}: 마지막 청크 뒤 {end - pos:,}바이트가 0으로 채워짐 - 미사용 할당 영역으로 봄")
+                elif gaps is not None:
                     gaps.append((pos, end))
                 return
             if gaps is not None:
@@ -333,6 +465,9 @@ def walk_movi_chunks(mm, start, end, gaps=None):
             pos = found
             continue
         ck_id, size = head
+        if ck_id == b"LIST":
+            pos += 12   # 'LIST....rec ' 그룹 안으로
+            continue
         yield pos, ck_id, size
         nxt = pos + 8 + size
         if size & 1:
@@ -347,53 +482,101 @@ def walk_movi_chunks(mm, start, end, gaps=None):
 def synthesize_idx1(mm, movi_fourcc_pos, movi_end):
     """idx1이 없을 때 movi를 걸어 색인을 만든다(offset은 'movi' FourCC 기준 = 기본 base A). 건너뛴 손상
     구간에는 스트림별 빈 자리(placeholder, idx_offset=-1)를 넣어 시간축(균등 분할)이 뒤로 밀리지 않게 한다.
-    빈 자리 수는 손상 구간 직전 2MB의 스트림별 청크 밀도로 추정한다."""
+    빈 자리 수는 손상 구간 앞뒤 GPS UTC 차이로 구하고, 그게 없으면 직전 2MB의 청크 밀도로 추정한다.
+    녹화 끝은 마지막 실제 청크다: 0 꼬리·잘린 마지막 청크에는 빈 자리를 넣지 않고(리뷰 #11), 옛 녹화 경계
+    (recording_cut_at)가 잡히면 그 뒤는 버린다. 판정 근거는 SYNTH_INFO에 남긴다."""
+    SYNTH_INFO.clear()
     entries = []
     gaps = []
+    tail = {}
     content_start = movi_fourcc_pos + 4
     walked = []   # (pos, ck_id, size)
-    for pos, ck_id, size in walk_movi_chunks(mm, content_start, movi_end, gaps):
+    for pos, ck_id, size in walk_movi_chunks(mm, content_start, movi_end, gaps, tail_info=tail):
         if ck_id == b"JUNK":
             continue
         walked.append((pos, ck_id, size))
     gaps = sorted(gaps)
-    cut_at = recording_cut_at(mm, walked, gaps)
+    cut_info = {}
+    cut_at = recording_cut_at(mm, walked, gaps, info=cut_info)
     if cut_at is not None:
         walked = [w for w in walked if w[0] < cut_at]
         gaps = [g for g in gaps if g[0] < cut_at]
+        tail = {}
     gap_iter = iter(gaps)
     pending_gap = next(gap_iter, None)
     for pos, ck_id, size in walked:
         while pending_gap is not None and pending_gap[0] < pos:
-            entries.extend(_placeholder_entries(walked, pending_gap))
+            entries.extend(_placeholder_entries(walked, pending_gap, mm=mm))
             pending_gap = next(gap_iter, None)
         entries.append({"chunk_id": ck_id, "flags": 0, "idx_offset": pos - movi_fourcc_pos, "length": size})
     while pending_gap is not None:
-        entries.extend(_placeholder_entries(walked, pending_gap))
+        entries.extend(_placeholder_entries(walked, pending_gap, mm=mm))
         pending_gap = next(gap_iter, None)
     DAMAGE_GAPS.extend(gaps)
+    last_chunk_end = (walked[-1][0] + 8 + walked[-1][2]) if walked else content_start
+    SYNTH_INFO.update({
+        "cut_at": cut_at, "cut_reason": cut_info.get("reason", ""),
+        "boundary_uncertain": bool(cut_info.get("uncertain")),
+        "zero_tail": list(tail["zero_tail"]) if tail.get("zero_tail") else None,
+        "truncated_tail": tail.get("truncated_tail"),
+        "last_chunk_end": last_chunk_end,
+        "placeholders": sum(1 for e in entries if e["idx_offset"] < 0),
+    })
     warn(f"idx1 없음 - movi를 걸어 색인 {len(entries)}개를 만듦"
-         + (f", 손상 구간 {len(gaps)}곳(빈 자리 {sum(1 for e in entries if e['idx_offset'] < 0)}개)" if gaps else ""))
+         + (f", 손상 구간 {len(gaps)}곳(빈 자리 {SYNTH_INFO['placeholders']}개)" if gaps else ""))
     return entries
 
 
-def recording_cut_at(mm, walked, gaps):
+def recording_cut_at(mm, walked, gaps, info=None):
     """사전 할당 파일은 실제 녹화 끝 뒤에 옛 녹화 잔재가 남는다. idx1이 없으면 어디가 끝인지 알 수 없으니
-    손상 구간 앞뒤의 GPS UTC 연속성으로 판단한다: 구간 뒤의 첫 UTC가 앞의 마지막 UTC보다 과거이거나
-    300초 넘게 뛰면 거기서 녹화가 끝난 것으로 본다(옛 녹화가 본 궤적에 섞이지 않게). 반환: 끝 위치 또는 None."""
+    손상 구간 앞뒤의 GPS 연속성으로 판단한다(리뷰 #8). 근거는 체크섬이 맞고 날짜가 있는 A 상태 RMC
+    (날짜+UTC, 자정 넘김 처리)뿐이다 - V 문장의 RTC 시각이나 체크섬이 깨진 문장은 근거가 아니다.
+      - 구간 뒤의 첫 기록이 앞의 마지막 기록보다 과거이면 → 옛 녹화 잔재(확실한 경계)
+      - 손상 바이트 수로 추정한 경과 시간보다 훨씬 더 뛰면 → 이어지지 않음(경계)
+      - 앞이나 뒤에 근거가 없으면: 구간이 0으로 덮인 것이면 같은 녹화로 보고, 아니면 '경계 불확실'로
+        표시하고 거기서 자른다(fail-open으로 옛 녹화를 섞지 않되, 뒤는 슬랙으로 따로 남긴다)
+    반환: 끝 위치 또는 None. info(dict)에 reason/uncertain/before/after를 남긴다."""
     for g0, g1 in sorted(gaps):
-        before = _last_rmc_utc(mm, [w for w in walked if w[0] < g0][-40:])
-        after = _first_rmc_utc(mm, [w for w in walked if w[0] >= g1][:40])
+        before_chunks = [w for w in walked if w[0] < g0]
+        after_chunks = [w for w in walked if w[0] >= g1]
+        before = _last_rmc_anchor(mm, before_chunks)
+        after = _first_rmc_anchor(mm, after_chunks)
         if before is not None and after is not None:
-            du = after - before
-            if du < -1 or du > 300:
-                warn(f"손상 구간 0x{g0:X} 뒤의 GPS UTC가 이어지지 않음(앞 {before:.0f}s → 뒤 {after:.0f}s) - "
-                     f"여기까지를 현재 녹화로 보고 뒤는 옛 녹화 잔재로 제외")
-                return g0
+            du = after[1] - before[1]
+            rate = _bytes_per_second(mm, before_chunks)
+            expected = (g1 - g0) / rate if rate else None
+            allow = (expected * 3 + 600) if expected is not None else 600
+            if du < -1:
+                reason = (f"손상 구간 0x{g0:X} 뒤의 GPS 시각이 과거(앞 {_fmt_anchor(before)} → 뒤 {_fmt_anchor(after)})")
+            elif du > allow:
+                reason = (f"손상 구간 0x{g0:X} 뒤의 GPS 시각이 손상 길이로 설명되지 않게 뜀"
+                          f"(앞 {_fmt_anchor(before)} → 뒤 {_fmt_anchor(after)}, {du:.0f}초"
+                          + (f", 손상 바이트로 추정한 경과 {expected:.0f}초" if expected is not None else "") + ")")
+            else:
+                continue
+            warn(reason + " - 여기까지를 현재 녹화로 보고 뒤는 옛 녹화 잔재로 제외")
+            if info is not None:
+                info.update({"reason": reason, "uncertain": False, "before": before, "after": after})
+            return g0
+        if _is_zero_region(mm, g0, min(g1, g0 + ZERO_GAP_PROBE)) and _zero_fraction(mm, g0, g1) >= ZERO_GAP_MIN_FRACTION:
+            # 0으로 덮인 구간은 같은 파일 안의 손상이지 옛 녹화와의 경계가 아니다(경계라면 옛 녹화의 청크
+            # 데이터가 바로 이어진다). 구간은 0으로 시작하고(머리가 지워진 자리) 끝에는 반쯤 지워진 청크의
+            # 꼬리가 남는다. GPS 근거가 없어도 같은 녹화로 본다.
+            warn(f"손상 구간 0x{g0:X}: 앞뒤 GPS 시각 근거가 없지만 0으로 덮인 구간이라 같은 녹화로 봄")
+            continue
+        reason = (f"손상 구간 0x{g0:X} 앞뒤에 날짜 있는 A 상태 RMC가 없어 녹화 경계를 확인할 수 없음"
+                  f"(앞 {_fmt_anchor(before)}, 뒤 {_fmt_anchor(after)})")
+        warn(reason + " - 경계 불확실: 여기까지를 현재 녹화로 보고 뒤는 슬랙으로 분리")
+        if info is not None:
+            info.update({"reason": reason, "uncertain": True, "before": before, "after": after})
+        return g0
     return None
 
 
 _RMC_UTC_RE = re.compile(rb"\$[A-Z]{2}RMC,(\d{2})(\d{2})(\d{2}(?:\.\d+)?),")
+_RMC_SENTENCE_RE = re.compile(rb"\$([A-Z]{2}RMC,[ -~]*?)\*([0-9A-Fa-f]{2})")
+ANCHOR_SCAN_CHUNKS = 20000   # 경계 판정 때 손상 구간 앞뒤로 살펴보는 청크 수(30fps+오디오로 약 5분)
+ANCHOR_MAX_CHUNK_BYTES = 4096
 
 
 def _chunk_rmc_utc(mm, pos, size):
@@ -401,6 +584,72 @@ def _chunk_rmc_utc(mm, pos, size):
     if not m:
         return None
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
+def _chunk_rmc_anchor(mm, pos, size):
+    """청크 안의 '근거가 되는' RMC: 체크섬이 맞고 상태 A이며 날짜가 있는 문장. 반환 (pos, 절대초) 또는 None.
+    절대초 = 날짜(서수)*86400 + UTC초 - 자정을 넘겨도 연속성 비교가 된다."""
+    end = min(pos + 8 + size, len(mm))
+    for m in _RMC_SENTENCE_RE.finditer(mm, pos + 8, end):
+        body = m.group(1)
+        calc = 0
+        for b in body:
+            calc ^= b
+        if calc != int(m.group(2), 16):
+            continue
+        fields = body.split(b",")
+        if len(fields) < 10 or fields[2] != b"A":
+            continue
+        t, d = fields[1], fields[9]
+        if len(t) < 6 or not t[:6].isdigit() or len(d) != 6 or not d.isdigit():
+            continue
+        try:
+            day = datetime.date(2000 + int(d[4:6]), int(d[2:4]), int(d[0:2]))
+            utc = int(t[0:2]) * 3600 + int(t[2:4]) * 60 + float(t[4:])
+        except ValueError:
+            continue
+        if utc >= 86400:
+            continue
+        return pos, day.toordinal() * 86400 + utc
+    return None
+
+
+def _last_rmc_anchor(mm, chunks, limit=ANCHOR_SCAN_CHUNKS):
+    for pos, _cid, size in reversed(chunks[-limit:]):
+        if size <= ANCHOR_MAX_CHUNK_BYTES:
+            a = _chunk_rmc_anchor(mm, pos, size)
+            if a is not None:
+                return a
+    return None
+
+
+def _first_rmc_anchor(mm, chunks, limit=ANCHOR_SCAN_CHUNKS):
+    for pos, _cid, size in chunks[:limit]:
+        if size <= ANCHOR_MAX_CHUNK_BYTES:
+            a = _chunk_rmc_anchor(mm, pos, size)
+            if a is not None:
+                return a
+    return None
+
+
+def _fmt_anchor(anchor):
+    if anchor is None:
+        return "없음"
+    day, sec = divmod(anchor[1], 86400)
+    return f"{datetime.date.fromordinal(int(day)):%Y-%m-%d} {int(sec) // 3600:02d}:{(int(sec) // 60) % 60:02d}:{sec % 60:05.2f}"
+
+
+def _bytes_per_second(mm, chunks, window=2 * 1024 * 1024):
+    """손상 구간 직전 window 바이트 안의 앵커 두 개로 기록 속도(바이트/초)를 구한다. 못 구하면 None."""
+    if not chunks:
+        return None
+    g0 = chunks[-1][0] + 8 + chunks[-1][2]
+    recent = [c for c in chunks[-ANCHOR_SCAN_CHUNKS:] if c[0] >= g0 - window]
+    last = _last_rmc_anchor(mm, recent)
+    first = _first_rmc_anchor(mm, recent)
+    if last is None or first is None or last[1] - first[1] < 5:
+        return None
+    return (last[0] - first[0]) / (last[1] - first[1])
 
 
 def _last_rmc_utc(mm, chunks):
@@ -421,8 +670,9 @@ def _first_rmc_utc(mm, chunks):
     return None
 
 
-def _placeholder_entries(walked, gap):
-    """손상 구간(gap) 직전 2MB의 청크 밀도로 스트림별 빈 자리 수를 추정한다."""
+def _placeholder_entries(walked, gap, mm=None):
+    """손상 구간(gap)에 넣을 스트림별 빈 자리 수. 구간 앞뒤에 날짜 있는 A 상태 RMC가 있으면 그 시각 차이로
+    (잃어버린 초 × 스트림별 초당 청크 수) 정하고, 없으면 직전 2MB의 청크 밀도(바이트÷밀도)로 추정한다."""
     g0, g1 = gap
     window_start = max(0, g0 - 2 * 1024 * 1024)
     before = [(p, cid, sz) for p, cid, sz in walked if window_start <= p < g0]
@@ -430,16 +680,48 @@ def _placeholder_entries(walked, gap):
         before = [(p, cid, sz) for p, cid, sz in walked if p >= g1][:200]
     if not before:
         return []
-    span = max(1, (before[-1][0] + 8 + before[-1][2]) - before[0][0])
-    out = []
     counts = {}
     for _p, cid, _sz in before:
         counts[cid] = counts.get(cid, 0) + 1
-    for cid, n in counts.items():
-        lost = round(n * (g1 - g0) / span)
+    lost_by_cid = None
+    if mm is not None:
+        lost_by_cid = _placeholder_counts_from_anchors(mm, walked, gap, counts)
+    if lost_by_cid is None:
+        span = max(1, (before[-1][0] + 8 + before[-1][2]) - before[0][0])
+        lost_by_cid = {cid: round(n * (g1 - g0) / span) for cid, n in counts.items()}
+    out = []
+    for cid, lost in lost_by_cid.items():
         out.extend({"chunk_id": cid, "flags": 0, "idx_offset": -1, "length": 0, "placeholder": True}
-                   for _ in range(lost))
+                   for _ in range(max(0, lost)))
     # 스트림이 섞여 있던 순서를 흉내 내지는 않는다(균등 분할 시간축은 개수만 쓴다).
+    return out
+
+
+def _placeholder_counts_from_anchors(mm, walked, gap, counts):
+    """앞뒤 앵커(날짜 있는 A 상태 RMC)의 시각 차이로 스트림별 잃어버린 청크 수를 센다. 근거가 없으면 None."""
+    g0, g1 = gap
+    before_chunks = [w for w in walked if w[0] < g0]
+    after_chunks = [w for w in walked if w[0] >= g1]
+    a1 = _last_rmc_anchor(mm, before_chunks)
+    a2 = _first_rmc_anchor(mm, after_chunks)
+    if a1 is None or a2 is None:
+        return None
+    du = a2[1] - a1[1]
+    if du < 0:
+        return None
+    recent = [c for c in before_chunks[-ANCHOR_SCAN_CHUNKS:] if c[0] >= a1[0] - 2 * 1024 * 1024]
+    a0 = _first_rmc_anchor(mm, recent)
+    if a0 is None or a1[1] - a0[1] < 5:
+        return None
+    span_sec = a1[1] - a0[1]
+    anchor_cid = next((cid for p, cid, _sz in walked if p == a1[0]), None)
+    out = {}
+    for cid in counts:
+        n_window = sum(1 for p, c, _sz in recent if c == cid and a0[0] < p <= a1[0])
+        rate = n_window / span_sec
+        present = sum(1 for p, c, _sz in walked if c == cid and a1[0] < p < a2[0])
+        expected = rate * du - (1 if cid == anchor_cid else 0)
+        out[cid] = max(0, round(expected - present))
     return out
 
 
@@ -451,15 +733,70 @@ def find_movi_fallback(mm):
     return pos
 
 
+BASE_SAMPLE_ENTRIES = 32   # base 판정·idx1 검증에 쓰는 표본 수(색인 전체에서 고르게 뽑는다)
+
+
+def _entry_tuple(e):
+    """idx1 엔트리(dict 또는 (cid, flags, off, length) 튜플)를 (cid, flags, off, length)로."""
+    if isinstance(e, dict):
+        return e["chunk_id"], e.get("flags", 0), e["idx_offset"], e["length"]
+    return e[0], e[1], e[2], e[3]
+
+
+def _spread_sample(entries, n=BASE_SAMPLE_ENTRIES):
+    """색인 전체에서 고르게 n개(앞 8개 포함). 앞부분이 손상된 파일에서 앞 엔트리만 보면 정답 base가 0점이
+    된다(리뷰 #27, #80)."""
+    total = len(entries)
+    if total <= n:
+        return list(entries)
+    picks = set(range(min(8, total)))
+    picks |= {round(i * (total - 1) / (n - 1)) for i in range(n)}
+    return [entries[i] for i in sorted(picks)]
+
+
+def _entry_target_state(mm, base, entry):
+    """엔트리가 가리키는 자리의 상태: 'match'(머리 일치) / 'zero'(0으로 덮임) / 'out'(파일 밖) / 'mismatch'."""
+    cid, _flags, off, length = _entry_tuple(entry)
+    p = base + off
+    if p < 0 or p + 8 > len(mm):
+        return "out"
+    head = bytes(mm[p:p + 8])
+    actual_id, actual_len = head[:4], struct.unpack_from("<I", head, 4)[0]
+    want_id = b"LIST" if cid == b"rec " else cid
+    if actual_id == want_id and actual_len == length:
+        return "match"
+    if head == bytes(8):
+        return "zero"
+    return "mismatch"
+
+
+def _score_base(mm, base, sample):
+    """표본 엔트리 가운데 (일치 수, 판정 가능 수). 0으로 덮인 자리·파일 밖은 분모에서 뺀다."""
+    hits = decided = 0
+    for e in sample:
+        st = _entry_target_state(mm, base, e)
+        if st == "match":
+            hits += 1
+            decided += 1
+        elif st == "mismatch":
+            decided += 1
+    return hits, decided
+
+
 def infer_base_from_entries(mm, entries, limit=16 * 1024 * 1024):
-    """앞 엔트리의 (id, size) 머리를 파일 앞부분에서 직접 찾아 base(offset 기준점)를 역산한다. 'movi'
-    FourCC가 0으로 덮인 헤더 손상 파일에서도 색인을 쓸 수 있게 한다. 못 찾으면 None."""
+    """엔트리의 (id, size) 머리를 파일 앞부분에서 직접 찾아 base(offset 기준점)를 역산한다. 'movi'
+    FourCC가 0으로 덮인 헤더 손상 파일에서도 색인을 쓸 수 있게 한다. 후보 base는 색인 전체에서 고르게 뽑은
+    표본과 과반 일치해야 받는다 - 고정 크기 청크(오디오 등)의 우연 일치로 엉뚱한 base가 뽑히면 idx1 전체가
+    다른 청크에 대응된다(리뷰 #27). 못 찾으면 None."""
+    if not entries:
+        return None
+    sample = _spread_sample(entries)
     votes = {}
     limit = min(len(mm), limit)
-    for e in entries[:32]:
-        cid = e["chunk_id"] if isinstance(e, dict) else e[0]
-        off = e["idx_offset"] if isinstance(e, dict) else e[2]
-        length = e["length"] if isinstance(e, dict) else e[3]
+    for e in sample:
+        cid, _flags, off, length = _entry_tuple(e)
+        if cid == b"rec ":
+            continue
         needle = cid + struct.pack("<I", length)
         p = mm.find(needle, 0, limit)
         hops = 0
@@ -471,62 +808,154 @@ def infer_base_from_entries(mm, entries, limit=16 * 1024 * 1024):
             hops += 1
     if not votes:
         return None
-    best = max(votes, key=votes.get)
-    return best if votes[best] >= 3 else None
+    best = None
+    for base, _v in sorted(votes.items(), key=lambda kv: -kv[1])[:8]:
+        hits, decided = _score_base(mm, base, sample)
+        if hits >= 3 and hits * 2 >= decided and (best is None or hits > best[1]):
+            best = (base, hits)
+    return best[0] if best else None
 
 
-def _idx1_entries_plausible(mm, pos, size):
-    """바이트 스캔으로 찾은 idx1이 진짜인지: 앞 엔트리들의 chunk id가 규격이고, movi 기준/절대/역산 base
-    가운데 하나로 실제 청크 머리와 절반 이상 맞아야 한다. 옛 녹화의 idx1 잔재나 압축 데이터 안의
-    우연한 'idx1'을 색인으로 쓰면 모든 엔트리가 어긋난다(손상 시나리오 '녹화 중단').
+def _index_reaches_chain(mm, base, entries, chain_start, max_chunks=256):
+    """색인이 현재 녹화의 첫 청크 사슬(chain_start)과 맞물리는가: 엔트리가 가리키는 가장 앞 자리가 사슬
+    시작보다 앞이거나, 사슬 시작에서 청크를 따라가 그 자리에 정확히 닿아야 한다. movi 안에 통째로 남은
+    옛 AVI의 idx1이나 뒤에 이어붙은 옛 파일의 idx1은 가리키는 자리가 사슬 밖이라 걸러진다(리뷰 #7)."""
+    if chain_start is None:
+        return True
+    targets = [base + _entry_tuple(e)[2] for e in entries]
+    if not targets:
+        return False
+    first = min(targets)
+    if first <= chain_start:
+        return True
+    pos = chain_start
+    end = len(mm)
+    for _ in range(max_chunks):
+        if pos == first:
+            return True
+        if pos > first:
+            return False
+        head = _chunk_header_ok(mm, pos, end)
+        if head is None:
+            if bytes(mm[pos:pos + 1]) == b"\0" and _chunk_header_ok(mm, pos + 1, end) is not None:
+                pos += 1
+                continue
+            return False
+        pos = pos + 12 if head[0] == b"LIST" else pos + 8 + head[1] + (head[1] & 1)
+    return False
+
+
+def _idx1_entries_plausible(mm, pos, size, chain_start=None):
+    """바이트 스캔으로 찾은 idx1이 진짜(현재 녹화의 것)인지. 조건:
+      - 표본 엔트리의 chunk id가 규격('rec ' 그룹 엔트리 포함)이고,
+      - movi 기준/절대/역산 base 가운데 하나로, 0으로 덮이지 않은 자리의 절반 이상이 실제 청크 머리와 맞고
+        (앞부분 손상 파일은 앞 엔트리가 0 영역을 가리켜도 통과 - 리뷰 #80),
+      - 판정 가능한 첫 엔트리들(앞 8개)이 맞아야 한다. 사전 할당 파일 끝에 남은 옛 idx1은 앞 엔트리가
+        현재 녹화의 청크를 가리켜 어긋나고 뒤 엔트리만 옛 청크와 맞는다(리뷰 #7),
+      - chain_start가 주어지면 색인이 현재 movi의 첫 청크 사슬과 맞물려야 한다.
     반환: 맞으면 base(int), 아니면 None."""
-    n = min(size // 16, 16)
-    if n == 0:
+    n_total = size // 16
+    if n_total == 0:
         return None
-    entries = [struct.unpack_from("<4sIII", mm, pos + 8 + i * 16) for i in range(n)]
-    if any(not CHUNK_ID_RE.fullmatch(cid) or length > MAX_CHUNK_BYTES for cid, _f, _o, length in entries):
+    n_head = min(n_total, 16)
+    head_entries = [struct.unpack_from("<4sIII", mm, pos + 8 + i * 16) for i in range(n_head)]
+    if any(not (CHUNK_ID_RE.fullmatch(cid) or cid == b"rec ") or length > MAX_CHUNK_BYTES
+           for cid, _f, _o, length in head_entries):
         return None
+    if n_total > n_head:
+        picks = sorted({round(i * (n_total - 1) / (BASE_SAMPLE_ENTRIES - 1)) for i in range(BASE_SAMPLE_ENTRIES)}
+                       - set(range(n_head)))
+        sample = head_entries + [struct.unpack_from("<4sIII", mm, pos + 8 + i * 16) for i in picks]
+        if any(not (CHUNK_ID_RE.fullmatch(cid) or cid == b"rec ") or length > MAX_CHUNK_BYTES
+               for cid, _f, _o, length in sample[n_head:]):
+            return None
+    else:
+        sample = head_entries
     movi = mm.find(b"movi", 0, pos)
     bases = [0]
     if movi >= 0:
         bases += [movi, movi + 4]
-    inferred = infer_base_from_entries(mm, entries)
-    if inferred is not None:
+    inferred = infer_base_from_entries(mm, sample)
+    if inferred is not None and inferred not in bases:
         bases.append(inferred)
+    # 'movi' FourCC까지 0으로 덮인 앞부분 손상 파일: 첫 청크 사슬(chain_start)에 어느 엔트리가 닿는다고 보고
+    # base를 역산한 후보도 넣는다. 뒤에 붙은 옛 녹화의 청크 배치가 현재와 같으면 (id, size) 역산은 옛 쪽으로
+    # 끌려가므로(위 inferred) 이 후보가 없으면 진짜 idx1을 놓친다.
+    if chain_start is not None:
+        for e in head_entries:
+            cand = chain_start - _entry_tuple(e)[2]
+            if cand >= 0 and cand not in bases:
+                bases.append(cand)
+    best = None
     for base in bases:
-        hits = 0
-        for cid, _flags, off, length in entries:
-            p = base + off
-            if 0 <= p and p + 8 <= len(mm) and bytes(mm[p:p + 4]) == cid \
-                    and struct.unpack_from("<I", mm, p + 4)[0] == length:
-                hits += 1
-        if hits * 2 >= n:
-            return base
-    return None
+        # 현재 녹화의 색인은 자기 movi 뒤에 있다 - 표본이 idx1 뒤를 가리키는 base는 옛 녹화 것이다.
+        if any(base + _entry_tuple(e)[2] >= pos for e in sample):
+            continue
+        states = [_entry_target_state(mm, base, e) for e in sample]
+        decided = [s for s in states if s in ("match", "mismatch")]
+        hits = decided.count("match")
+        if hits == 0 or hits * 2 < len(decided):
+            continue
+        lead = decided[:8]
+        if lead.count("match") * 2 < len(lead):
+            continue
+        if not _index_reaches_chain(mm, base, sample, chain_start):
+            continue
+        if best is None or hits > best[1]:
+            best = (base, hits)
+    return best[0] if best else None
 
 
-def find_idx1_fallback(mm):
+def find_idx1_fallback(mm, chain_start=None):
+    """'idx1'을 뒤에서부터 찾되 현재 녹화의 것만 받는다(_idx1_entries_plausible). 사전 할당 파일 뒤쪽의
+    옛 idx1은 검증에서 떨어지므로 계속 앞으로 찾는다. 반환 (pos, size) 또는 None."""
     filesize = len(mm)
+    if chain_start is None:
+        chain_start = first_chunk_chain(mm)
     search_end = filesize
+    # 검증을 통과한 후보를 모두 모은 뒤, 자기가 가리키는 영역(마지막 엔트리 끝) 뒤에 있는 것 가운데 가장 앞의
+    # idx1을 고른다. 뒤에 붙은 옛 녹화의 idx1이 현재 녹화와 청크 배치가 같아 검증을 통과해도, 현재 녹화의
+    # idx1이 그보다 앞(영역 바로 뒤)에 있으므로 그것이 뽑힌다(리뷰 #7 후속).
+    candidates = []
     while True:
         pos = mm.rfind(b"idx1", 0, search_end)
         if pos < 0:
-            return None
-        if pos + 8 <= filesize:
+            break
+        if pos + 8 <= filesize and (chain_start is None or pos > chain_start):
             size = struct.unpack_from("<I", mm, pos + 4)[0]
-            if size % 16 == 0 and pos + 8 + size <= filesize and _idx1_entries_plausible(mm, pos, size) is not None:
-                warn("구조 파싱 실패, idx1 바이트 스캔(rfind) fallback 사용 "
-                     f"(size 16배수·엔트리 검증 통과, @0x{pos:X})")
-                return pos, size
-            if size % 16 == 0 and size > 0 and pos + 8 < filesize and pos + 8 + size > filesize:
-                # 끝이 잘린 idx1: 남은 만큼(16바이트 단위)만 받는다(리뷰 #10).
-                usable = ((filesize - pos - 8) // 16) * 16
-                if usable > 0 and _idx1_entries_plausible(mm, pos, usable) is not None:
-                    warn(f"idx1 @0x{pos:X}가 파일 끝에서 잘림 - 남은 {usable}바이트만 사용")
-                    return pos, usable
+            usable = None
+            if size % 16 == 0 and pos + 8 + size <= filesize:
+                usable = size
+            elif size % 16 == 0 and size > 0 and pos + 8 < filesize and pos + 8 + size > filesize:
+                usable = ((filesize - pos - 8) // 16) * 16      # 끝이 잘린 idx1(리뷰 #10)
+            if usable:
+                base = _idx1_entries_plausible(mm, pos, usable, chain_start=chain_start)
+                if base is not None:
+                    candidates.append((pos, usable, usable < size, _index_region_end(mm, base, pos, usable)))
         search_end = pos
         if search_end <= 0:
-            return None
+            break
+    if not candidates:
+        return None
+    after = [c for c in candidates if c[3] <= c[0]]
+    pos, usable, truncated, _end = min(after or candidates, key=lambda c: c[0])
+    if truncated:
+        warn(f"idx1 @0x{pos:X}가 파일 끝에서 잘림 - 남은 {usable}바이트만 사용")
+    else:
+        warn("구조 파싱 실패, idx1 바이트 스캔(rfind) fallback 사용 "
+             f"(size 16배수·엔트리 검증 통과, @0x{pos:X})")
+    return pos, usable
+
+
+def _index_region_end(mm, base, pos, size):
+    """색인이 가리키는 영역의 끝(표본 엔트리 가운데 가장 뒤 청크의 끝). 마지막 엔트리를 포함한다."""
+    n = size // 16
+    picks = {n - 1} | {round(i * (n - 1) / 7) for i in range(8)} if n > 0 else set()
+    end = 0
+    for i in picks:
+        e = struct.unpack_from("<4sIII", mm, pos + 8 + i * 16)
+        end = max(end, base + e[2] + 8 + e[3])
+    return end
 
 
 def parse_hdrl(mm, hdrl_chunk):
@@ -708,24 +1137,26 @@ def detect_base_offset(mm, movi_fourcc_pos, idx1_entries, sample_n=SAMPLE_ENTRIE
         candidates["B(movi 데이터 시작=A+4)"] = movi_fourcc_pos + 4
     candidates["C(절대 offset, base=0)"] = 0
 
-    sample = idx1_entries[:sample_n] if idx1_entries else []
-    # 후보 D: 'movi' FourCC가 0으로 덮였거나 엉뚱한 곳에서 잡힌 경우, 앞 엔트리의 (id, size) 머리를
-    # 파일 앞 16MB에서 직접 찾아 base를 역산한다(헤더 손상 파일 복구).
-    best = infer_base_from_entries(mm, idx1_entries) if idx1_entries else None
+    # 표본은 색인 전체에서 고르게 뽑고(빈 자리 제외), 0으로 덮인 자리는 분모에서 뺀다. 앞 엔트리만 보면
+    # movi 앞부분이 손상된 파일에서 정답 후보 A가 0점이 되고, 고정 크기 청크의 우연 일치로 역산 base가
+    # 뽑혔다(리뷰 #27).
+    real_entries = [e for e in idx1_entries if e.get("idx_offset", -1) >= 0] if idx1_entries else []
+    sample = _spread_sample(real_entries, max(sample_n, BASE_SAMPLE_ENTRIES)) if real_entries else []
+    # 후보 D: 'movi' FourCC가 0으로 덮였거나 엉뚱한 곳에서 잡힌 경우, 엔트리의 (id, size) 머리를
+    # 파일 앞 16MB에서 직접 찾아 base를 역산한다(헤더 손상 파일 복구). 표본과 과반 일치할 때만 나온다.
+    best = infer_base_from_entries(mm, real_entries) if real_entries else None
     if best is not None and best not in candidates.values():
         candidates[f"D(엔트리 역산 base=0x{best:X})"] = best
     scores = {}
+    decided_n = {}
     for label, base in candidates.items():
-        score = 0
-        for e in sample:
-            off = base + e["idx_offset"]
-            if 0 <= off and off + 4 <= filesize and bytes(mm[off:off + 4]) == e["chunk_id"]:
-                score += 1
-        scores[label] = score
+        hits, decided = _score_base(mm, base, sample)
+        scores[label] = hits
+        decided_n[label] = decided
 
     info("[Base offset 후보 매치 점수]")
     for label, score in scores.items():
-        info(f"  {label}: {score}/{len(sample)}")
+        info(f"  {label}: {score}/{decided_n[label]} (표본 {len(sample)}개, 0으로 덮인 자리 제외)")
 
     if not scores or max(scores.values()) == 0:
         warn("어떤 base 후보도 idx1 엔트리와 일치하지 않음 - base 불확실, 기본값(A) 사용")
@@ -733,6 +1164,7 @@ def detect_base_offset(mm, movi_fourcc_pos, idx1_entries, sample_n=SAMPLE_ENTRIE
         chosen_base = candidates.get(chosen_label, 0)
         return chosen_base, chosen_label, scores, True
 
+    # 동점이면 먼저 적힌 후보(A·B·C 순)가 이긴다 - 역산 후보 D는 A·B·C가 모두 밀릴 때만 쓴다.
     chosen_label = max(scores, key=scores.get)
     chosen_base = candidates[chosen_label]
     return chosen_base, chosen_label, scores, False
@@ -896,11 +1328,15 @@ def find_embedded_nmea_text(payload):
     cands = [m.group(1).decode("ascii", errors="replace") for m in EMBEDDED_NMEA_RE.finditer(payload)]
     if not cands:
         return None
+    # 체크섬이 맞는 RMC → 체크섬이 맞는 GGA → (체크섬 없는) RMC → GGA → 나머지. 종류를 먼저 보면 체크섬이
+    # 틀린 RMC가 정상 GGA를 밀어내 측위 자체가 없어졌다(리뷰 #107).
+    for ok in (True, None):
+        for want in ("RMC", "GGA"):
+            for c in cands:
+                if c[2:5] == want and nmea_checksum_ok(c) is ok:
+                    return c
     for want in ("RMC", "GGA"):
         typed = [c for c in cands if c[2:5] == want]
-        for c in typed:
-            if nmea_checksum_ok(c):
-                return c
         if typed:
             return typed[0]
     return cands[0]
@@ -922,6 +1358,10 @@ def try_float_vector(payload):
 
 
 def classify_payload(payload, stream_fcc=None):
+    if not payload or payload == bytes(len(payload)):
+        # 0으로 채워진 청크(측위 전 자리 채움·사전 할당 잔여): 데이터가 아니라 '없음'이다. binary로 세면
+        # 정상 GPS 스트림이 다수결(80%)에 못 미쳐 통째로 버려졌다(리뷰 #23).
+        return "empty", None
     nmea_line = find_embedded_nmea_text(payload)
     if nmea_line:
         return "nmea_text", nmea_line
@@ -1384,12 +1824,74 @@ def first_riff_video_duration(stream_table, idx1_entries):
     return None
 
 
+def measured_video_duration(stream_table, idx1_entries):
+    """색인에 실제로 있는 영상 프레임 수(손상 구간의 빈 자리 포함) ÷ fps. 헤더의 dwLength는 녹화가 중단되거나
+    끝이 잘린 파일에서 계획값·전체값이라, 그걸 남은 레코드 수로 나누면 시간축이 늘어나거나 줄어든다
+    (리뷰 #10, #11, #61). 정상 파일에서는 dwLength와 같다. 못 구하면 None."""
+    for s in stream_table:
+        if s.fcc_type != b"vids" or not (s.dw_rate and s.dw_scale):
+            continue
+        fps = s.dw_rate / s.dw_scale
+        frames = sum(1 for e in idx1_entries if stream_index_from_chunk_id(e["chunk_id"]) == s.index)
+        if fps > 0 and frames:
+            return frames / fps, f"색인 영상 프레임 {frames}개 / {fps:.3f}fps"
+    return None
+
+
 def build_avi_stream_times(video_duration, record_count):
     """레코드 수로 균등 분할한 (start_sec, end_sec) 목록."""
     if not video_duration or record_count <= 0:
         return []
     step = video_duration / record_count
     return [(i * step, (i + 1) * step) for i in range(record_count)]
+
+
+def supplement_truncated_index(mm, idx1_entries, base_offset, movi_end):
+    """끝이 잘린 idx1(파일 끝에서 절단) 뒤에도 movi가 남아 있으면 마지막 색인 청크 다음부터 걸어 색인을
+    보충한다(리뷰 #10). 보충 엔트리는 supplemented=True. 반환: (추가 엔트리 수, 손상 구간 수)."""
+    last_end = None
+    for e in idx1_entries:
+        if e.get("idx_offset", -1) < 0:
+            continue
+        if _entry_target_state(mm, base_offset, e) == "match":
+            end = base_offset + e["idx_offset"] + 8 + e["length"]
+            if last_end is None or end > last_end:
+                last_end = end
+    if last_end is None or last_end + 8 > movi_end:
+        return 0, 0
+    if _chunk_header_ok(mm, last_end, movi_end) is None and bytes(mm[last_end:last_end + 1]) == b"\0":
+        last_end += 1
+    gaps = []
+    tail = {}
+    walked = []
+    for pos, ck_id, size in walk_movi_chunks(mm, last_end, movi_end, gaps, tail_info=tail):
+        if ck_id != b"JUNK":
+            walked.append((pos, ck_id, size))
+    if not walked:
+        return 0, 0
+    cut_info = {}
+    cut_at = recording_cut_at(mm, walked, sorted(gaps), info=cut_info)
+    if cut_at is not None:
+        walked = [w for w in walked if w[0] < cut_at]
+        gaps = [g for g in gaps if g[0] < cut_at]
+    added = 0
+    gap_iter = iter(sorted(gaps))
+    pending_gap = next(gap_iter, None)
+    for pos, ck_id, size in walked:
+        while pending_gap is not None and pending_gap[0] < pos:
+            idx1_entries.extend(_placeholder_entries(walked, pending_gap, mm=mm))
+            pending_gap = next(gap_iter, None)
+        idx1_entries.append({"chunk_id": ck_id, "flags": 0, "idx_offset": pos - base_offset, "length": size,
+                             "supplemented": True})
+        added += 1
+    DAMAGE_GAPS.extend(sorted(gaps))
+    SYNTH_INFO.update({"supplemented": added, "cut_at": cut_at, "cut_reason": cut_info.get("reason", ""),
+                       "boundary_uncertain": bool(cut_info.get("uncertain")),
+                       "zero_tail": list(tail["zero_tail"]) if tail.get("zero_tail") else None,
+                       "truncated_tail": tail.get("truncated_tail")})
+    warn(f"잘린 idx1 뒤의 movi를 걸어 색인 {added}개를 보충함" + (f", 손상 구간 {len(gaps)}곳" if gaps else ""))
+    return added, len(gaps)
+
 
 def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
                      dry_run=False, stream_times=None, start_dt=None):
@@ -1409,7 +1911,7 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
     preview_printed = {s.index: 0 for s in selected_streams}
 
     classify_counts = {s.index: {"nmea_text": 0, "generic_text": 0, "record72": 0,
-                                  "float_vector": 0, "binary": 0}
+                                  "float_vector": 0, "binary": 0, "empty": 0}
                         for s in selected_streams}
     coord_rows_by_stream = {s.index: [] for s in selected_streams}
     unparsed_by_stream = {s.index: [] for s in selected_streams}
@@ -1433,11 +1935,6 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
         if stream is None:
             continue
 
-        chunk_offset = base_offset + e["idx_offset"]
-        reasons, payload_offset, header_size = validate_chunk(mm, chunk_offset, e)
-        status = "|".join(reasons)
-        validation_counts[status] = validation_counts.get(status, 0) + 1
-
         display_label, dir_label, prefix = labels[stream.index]
         seq = seq_counters[stream.index]
         seq_counters[stream.index] += 1
@@ -1446,6 +1943,25 @@ def extract_payload(mm, out_dir, selected_streams, idx1_entries, base_offset,
         time_source = "avi_video_duration" if start_sec is not None else ""
         start_disp = f"{start_sec:.3f}" if start_sec is not None else ""
         end_disp = f"{end_sec:.3f}" if end_sec is not None else ""
+
+        if e.get("placeholder") or e["idx_offset"] < 0:
+            # 색인 재구성 때 손상 구간에 넣은 빈 자리: 실제 청크가 아니므로 검증·파일 쓰기·경고 없이 자리만
+            # 센다(시간축 균등 분할용). index.csv에는 DAMAGED_PLACEHOLDER로 따로 적는다(리뷰 #63).
+            validation_counts["DAMAGED_PLACEHOLDER"] = validation_counts.get("DAMAGED_PLACEHOLDER", 0) + 1
+            index_rows.append({
+                "sequence": seq, "stream_index": stream.index, "stream_label": display_label,
+                "fcc_type": (stream.fcc_type or b"").decode("ascii", errors="replace"),
+                "chunk_id": e["chunk_id"].decode("ascii", errors="replace"),
+                "idx1_entry_offset": "", "relative_offset": "", "absolute_chunk_offset": "",
+                "payload_offset": "", "idx1_length": "", "chunk_header_length": "", "flags": "",
+                "validation": "DAMAGED_PLACEHOLDER", "output_file": "",
+            })
+            continue
+
+        chunk_offset = base_offset + e["idx_offset"]
+        reasons, payload_offset, header_size = validate_chunk(mm, chunk_offset, e)
+        status = "|".join(reasons)
+        validation_counts[status] = validation_counts.get(status, 0) + 1
 
         output_file = ""
         if "OUT_OF_RANGE" not in reasons:
@@ -1661,16 +2177,23 @@ def save_metadata(out_dir, index_rows, stream_table, labels, dry_run=False):
             f.write(w_msg + "\n")
 
 
+NMEA_PARSED_MIN_FRACTION = 0.5   # 구조가 맞는 NMEA(또는 FineVu 레코드)가 절반 이상이면 손상 청크가 섞여도 GPS 스트림
+
+
 def decide_stream_kind(counts, min_fraction=DECODE_MIN_FRACTION):
-    total = sum(counts.values())
+    """스트림 종류 다수결. 0으로 채워진 청크(empty)는 분모에서 뺀다. 텍스트·레코드 비율이 80%에 못 미쳐도
+    실제로 해석된 NMEA 문장·FineVu 레코드가 절반 이상이면 그 종류로 본다 - 손상으로 깨진 청크 몇 개 때문에
+    정상 GPS가 'GPS 없음'이 되면 안 된다(리뷰 #23). 임의 바이트열은 NMEA·레코드 검증을 통과하지 못한다."""
+    total = sum(v for k, v in counts.items() if k != "empty")
     if total == 0:
         return None
     text_ratio = (counts["nmea_text"] + counts["generic_text"]) / total
+    nmea_ratio = counts["nmea_text"] / total
     record72_ratio = counts.get("record72", 0) / total
     float_ratio = counts["float_vector"] / total
-    if text_ratio >= min_fraction:
+    if text_ratio >= min_fraction or nmea_ratio >= NMEA_PARSED_MIN_FRACTION:
         return "text"
-    if record72_ratio >= min_fraction:
+    if record72_ratio >= min_fraction or record72_ratio >= NMEA_PARSED_MIN_FRACTION:
         return "record72"
     if float_ratio >= min_fraction:
         return "float_vector"
@@ -1905,7 +2428,7 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
         with open(decode_detect_csv, "w", newline="", encoding="utf-8") as f:
             w = _GuardListWriter(csv.writer(f))
             w.writerow(["stream_index", "nmea_text", "generic_text", "record72",
-                        "float_vector", "binary", "decision"])
+                        "float_vector", "binary", "decision", "empty"])
             for s in selected_streams:
                 c = classify_counts.get(s.index, {})
                 info_row = decode_summary[s.index]
@@ -1915,7 +2438,7 @@ def write_decoded_outputs(out_dir, selected_streams, labels, extract_result, dry
                     info_row["kind"], "BINARY/미상 (raw만 보존)")
                 w.writerow([s.index, c.get("nmea_text", 0), c.get("generic_text", 0),
                             c.get("record72", 0), c.get("float_vector", 0),
-                            c.get("binary", 0), decision])
+                            c.get("binary", 0), decision, c.get("empty", 0)])
 
     return decode_summary
 
@@ -2058,7 +2581,9 @@ def current_recording_end(mm):
         if idx1 is not None:
             idx1_end = idx1.data_start + idx1.ck_size
         else:
-            fb = find_idx1_fallback(mm)
+            # 현재 녹화의 idx1만 본다. 뒤에 이어붙은 옛 AVI의 idx1을 집으면 선언 크기가 잘못됐다고 판정해
+            # 트레일링 슬랙을 통째로 놓쳤다(리뷰 #62).
+            fb = find_idx1_fallback(mm, chain_start=first_chunk_chain(mm, 0, end))
             idx1_end = fb[0] + 8 + fb[1] if fb is not None else 0
         if idx1_end > end + 1:
             return filesize, "invalid"
@@ -2280,11 +2805,15 @@ def detect_slack_info(path):
 SLACK_NMEA_RE = re.compile(rb"\$?[A-Z]{2}(?:RMC|GGA),[ -~]*")
 
 
-def run_slack_carve_avi(mm, out_dir, dry_run=False):
+def run_slack_carve_avi(mm, out_dir, dry_run=False, extra_regions=None):
     """슬랙 영역에서 NMEA GPS 문장을 카빙해 <out_dir>/slack/ 에 남긴다. 원본은 수정하지 않는다.
     열 구성은 integration_mp4.py 의 슬랙 카빙과 같다(앱이 같은 코드로 읽는다). FineVu 72바이트
-    이진 레코드는 텍스트가 아니라 여기서 찾지 못한다(NMEA 기기만 해당)."""
+    이진 레코드는 텍스트가 아니라 여기서 찾지 못한다(NMEA 기기만 해당).
+    extra_regions: 색인 재구성 때 녹화 경계 뒤로 잘라낸 구간 [(kind, start, end)] - 본 궤적과 분리해 남긴다."""
     regions = slack_regions_avi(mm)
+    for kind, s, e in (extra_regions or []):
+        if e > s and not any(rs <= s and e <= re_ for _k, rs, re_ in regions):
+            regions.append((kind, s, e))
     if not regions:
         info("[슬랙] 옛 녹화 잔재도 트레일링 영역도 없음 - 카빙 대상 없음")
         return None
@@ -2333,6 +2862,10 @@ def run_slack_carve_avi(mm, out_dir, dry_run=False):
                 "녹화 파일의 잔재(embedded)와 최상위 RIFF 뒤의 꼬리(trailing) - 에서 카빙한\n"
                 "NMEA GPS 문장입니다.\n\n"
                 "- 현재 녹화분이 아니라 같은 저장매체에 예전에 기록됐던 내용입니다.\n"
+                "- after_cut_old_recording: 색인(idx1)이 없어 movi를 걸어 색인을 만들 때 GPS 날짜·시각이\n"
+                "  이어지지 않아 옛 녹화 잔재로 판정해 잘라낸 구간입니다.\n"
+                "- after_cut_uncertain: 손상 구간 앞뒤에 판정 근거(날짜 있는 A 상태 RMC)가 없어 현재 녹화인지\n"
+                "  옛 녹화인지 확인하지 못한 구간입니다. 본 궤적에 넣지 않고 여기 따로 남깁니다.\n"
                 "- 재생 시각(영상 시간축)에 매핑할 수 없습니다. 절대 byte offset만 남깁니다.\n"
                 "- 해석/검증은 정상 추출분과 같습니다(checksum 포함). checksum_ok=False 인 행은\n"
                 "  우연히 만들어진 바이트열일 수 있습니다.\n"
@@ -2464,164 +2997,208 @@ def process_single_file(input_path, output_root, args):
     select_chunk_ids = {v.encode("ascii") for v in args.chunk_id} if args.chunk_id else SELECT_CHUNK_IDS
 
     work_path = None
-    with open(input_path, "rb") as f:
-        mm0 = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    f0 = open(input_path, "rb")
+    mm0 = mmap.mmap(f0.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
         process_path, is_new_file = handle_slack(input_path, mm0, out_dir,
                                                   dry_run=args.dry_run,
                                                   repair=getattr(args, "repair_slack", False))
-        if getattr(args, "slack", False):
-            try:
-                run_slack_carve_avi(mm0, out_dir, dry_run=args.dry_run)
-            except Exception as exc:
-                warn(f"슬랙 카빙 중 예외 - 정상 추출 결과에는 영향 없음: {exc}")
-        mm0.close()
         if is_new_file:
             work_path = process_path
+        active_path = work_path or input_path
+        with open(active_path, "rb") as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                _process_opened(input_path, active_path, work_path, mm, mm0, out_dir, args,
+                                select_mode, select_fcctypes, select_indices, select_chunk_ids)
+            finally:
+                mm.close()
+    finally:
+        mm0.close()
+        f0.close()
 
-    active_path = work_path or input_path
 
-    with open(active_path, "rb") as f:
-        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+def _process_opened(input_path, active_path, work_path, mm, mm0, out_dir, args,
+                    select_mode, select_fcctypes, select_indices, select_chunk_ids):
+    hdrl, movi_list, idx1_chunk, avix_count = find_top_level_sections(mm)
 
-        hdrl, movi_list, idx1_chunk, avix_count = find_top_level_sections(mm)
-
-        movi_fourcc_pos = movi_list[0].data_start if movi_list else None
+    movi_fourcc_pos = movi_list[0].data_start if movi_list else None
+    if movi_fourcc_pos is None:
+        movi_fourcc_pos = find_movi_fallback(mm)
         if movi_fourcc_pos is None:
-            movi_fourcc_pos = find_movi_fallback(mm)
+            warn("movi 를 전혀 찾지 못함")
+
+    DAMAGE_GAPS.clear()
+    SYNTH_INFO.clear()
+    synthesized_index = False
+    idx1_truncated = False
+    if idx1_chunk is not None:
+        idx1_start = idx1_chunk.data_start
+        idx1_size = idx1_chunk.ck_size
+        idx1_truncated = bool(idx1_chunk.truncated) or idx1_start + idx1_size > len(mm)
+    else:
+        fb = find_idx1_fallback(mm, chain_start=first_chunk_chain(mm))
+        if fb is None:
             if movi_fourcc_pos is None:
-                warn("movi 를 전혀 찾지 못함")
-
-        DAMAGE_GAPS.clear()
-        synthesized_index = False
-        if idx1_chunk is not None:
-            idx1_start = idx1_chunk.data_start
-            idx1_size = idx1_chunk.ck_size
+                print(f"{input_path}: idx1도 movi도 찾지 못했습니다. 이 파일은 처리할 수 없습니다.", file=sys.stderr)
+                return
+            # 녹화 중단으로 idx1이 통째로 잘린 파일: movi의 청크 머리를 걸어 색인을 다시 만든다.
+            idx1_start, idx1_size = -1, 0
+            synthesized_index = True
         else:
-            fb = find_idx1_fallback(mm)
-            if fb is None:
-                if movi_fourcc_pos is None:
-                    print(f"{input_path}: idx1도 movi도 찾지 못했습니다. 이 파일은 처리할 수 없습니다.", file=sys.stderr)
-                    mm.close()
-                    return
-                # 녹화 중단으로 idx1이 통째로 잘린 파일: movi의 청크 머리를 걸어 색인을 다시 만든다.
-                idx1_start, idx1_size = -1, 0
-                synthesized_index = True
-            else:
-                idx1_start, idx1_size = fb
-                idx1_start += 8
+            idx1_start, idx1_size = fb
+            idx1_start += 8
+            declared = struct.unpack_from("<I", mm, idx1_start - 4)[0]
+            idx1_truncated = idx1_start + declared > len(mm)
 
-        if synthesized_index:
-            movi_end = movi_list[0].data_end if movi_list else len(mm)
-            idx1_entries = synthesize_idx1(mm, movi_fourcc_pos, movi_end)
+    if synthesized_index:
+        movi_end = movi_list[0].data_end if movi_list else len(mm)
+        idx1_entries = synthesize_idx1(mm, movi_fourcc_pos, movi_end)
+    else:
+        idx1_entries = parse_idx1(mm, idx1_start, idx1_size)
+
+    dw_streams, streams = (None, [])
+    if hdrl is not None:
+        dw_streams, streams = parse_hdrl(mm, hdrl)
+    else:
+        warn("hdrl 을 찾지 못함 - 스트림 타입 불명, chunk id 기반 fallback만 사용")
+
+    stream_table = build_stream_table(dw_streams, streams, idx1_entries)
+    print_stream_table(stream_table)
+
+    selected_chunk_ids = resolve_targets(
+        stream_table, select_mode, select_fcctypes, select_indices, select_chunk_ids)
+    selected_streams = [s for s in stream_table if s.selected]
+
+    opendml_info = detect_opendml(mm, movi_list, avix_count, stream_table)
+
+    base_offset, base_label, base_scores, base_uncertain = detect_base_offset(
+        mm, movi_fourcc_pos, idx1_entries)
+    info(f"\n[Base offset 선택] {base_label} -> base=0x{base_offset:X}"
+         f"{' (불확실)' if base_uncertain else ''}")
+
+    if not selected_streams:
+        warn("선택된 스트림이 없습니다. SELECT_MODE/조건을 확인하세요.")
+
+    if idx1_truncated and not synthesized_index and movi_fourcc_pos is not None:
+        # 끝이 잘린 idx1: 남은 movi를 걸어 색인을 보충한다(리뷰 #10). 잘린 idx1 바깥의 GPS를 버리지 않는다.
+        movi_end = min(movi_list[0].data_end, idx1_start - 8) if movi_list else idx1_start - 8
+        supplement_truncated_index(mm, idx1_entries, base_offset, movi_end)
+
+    # 재생 시간축: 텍스트 스트림 strh가 깨져 있는 기기가 많아 영상 스트림 길이를
+    # 레코드 수로 나눠 균등 간격을 만든다(자세한 근거는 compute_video_duration 참고).
+    video_duration, duration_source = compute_video_duration(mm, hdrl, stream_table)
+    header_duration = video_duration
+    measured = measured_video_duration(stream_table, idx1_entries)
+    if measured is not None and (video_duration is None or abs(measured[0] - video_duration) > 0.5):
+        # 색인의 실제 영상 프레임 수 ÷ fps. 헤더 길이(계획값·전체값)를 남은 레코드 수로 나누면 녹화 중단·
+        # 절단·AVIX 파일에서 시간축이 늘거나 줄어 실측처럼 보인다(리뷰 #10, #11, #61).
+        if video_duration is not None:
+            warn(f"[시간축] 헤더 길이 {video_duration:.3f}초({duration_source})와 색인 영상 프레임 기준 "
+                 f"{measured[0]:.3f}초가 다름 - 색인 기준(실제 남은 프레임)을 사용")
+        video_duration, duration_source = measured
+    if video_duration:
+        info(f"[시간축] 영상 길이 {video_duration:.3f}초 ({duration_source})")
+    else:
+        warn(f"[시간축] {duration_source} - start_time_sec 계열은 공란으로 둠")
+    entries_per_stream = {}
+    for e in idx1_entries:
+        sidx = stream_index_from_chunk_id(e["chunk_id"])
+        if sidx is not None:
+            entries_per_stream[sidx] = entries_per_stream.get(sidx, 0) + 1
+    stream_times = {}
+    for st in selected_streams:
+        n = entries_per_stream.get(st.index, 0)
+        stream_times[st.index] = build_avi_stream_times(video_duration, n)
+
+    # 72바이트 레코드 경로에서 레코드별 절대 시각(abs_time)을 만들려면 녹화 시작
+    # 시각이 필요한데, 이 계열은 그 값을 파일 안에 안 남기고 파일명에만 남긴다
+    # (뷰어도 날짜/시간을 파일명에서 가져온다).
+    start_dt = finevu_filename_start_time(input_path)
+    if start_dt is not None:
+        info(f"[시간축] 파일명 기준 녹화 시작 시각 {start_dt:%Y-%m-%d %H:%M:%S}")
+
+    result = extract_payload(
+        mm, out_dir, selected_streams, idx1_entries, base_offset,
+        dry_run=args.dry_run, stream_times=stream_times, start_dt=start_dt)
+
+    save_metadata(out_dir, result["index_rows"], stream_table,
+                   result["labels"], dry_run=args.dry_run)
+
+    decode_summary = write_decoded_outputs(
+        out_dir, selected_streams, result["labels"], result, dry_run=args.dry_run)
+
+    # GPS/센서를 재생 시각 기준 한 줄로 합친 통합 타임라인(시각화용).
+    n_timeline = write_avi_timeline(out_dir, selected_streams, result["labels"],
+                                     result, dry_run=args.dry_run, decode_summary=decode_summary)
+    if n_timeline:
+        info(f"[시간축] timeline.csv {n_timeline}행 생성")
+
+    info("\n" + "=" * 60)
+    info(f"[요약] {input_path}")
+    info(f"슬랙 리페어 적용 여부  : {'예 (' + work_path + ')' if work_path else '아니오'}")
+    info(f"movi offset            : 0x{movi_fourcc_pos:X} "
+         f"(발견된 movi 개수: {opendml_info['movi_count']})" if movi_fourcc_pos is not None
+         else "movi offset            : 없음")
+    info(f"idx1 offset             : {'(없음 - movi 걷기로 재구성)' if synthesized_index else f'0x{idx1_start:X}'}")
+    if DAMAGE_GAPS:
+        info("손상(건너뛴) 구간        : " + ", ".join(f"0x{a:X}-0x{b:X}" for a, b in DAMAGE_GAPS[:20]))
+    if SYNTH_INFO.get("cut_at") is not None:
+        info(f"녹화 경계               : 0x{SYNTH_INFO['cut_at']:X}"
+             f"{' (경계 불확실 - 뒤는 슬랙으로 분리)' if SYNTH_INFO.get('boundary_uncertain') else ' (옛 녹화 잔재 제외)'}")
+    if DAMAGE_GAPS or synthesized_index or idx1_truncated or SYNTH_INFO:
+        # 앱(core/damage.py 등)이 읽는 한 줄 JSON. 색인 재구성·보충의 판정 근거와 실측 길이를 같이 넘긴다.
+        print("DAMAGE_JSON " + json.dumps({
+            "gaps": DAMAGE_GAPS[:1000], "synthesized_index": synthesized_index,
+            "idx1_truncated": idx1_truncated,
+            "supplemented_entries": SYNTH_INFO.get("supplemented", 0),
+            "placeholders": SYNTH_INFO.get("placeholders", 0),
+            "cut_at": SYNTH_INFO.get("cut_at"), "cut_reason": SYNTH_INFO.get("cut_reason", ""),
+            "boundary_uncertain": bool(SYNTH_INFO.get("boundary_uncertain")),
+            "zero_tail": SYNTH_INFO.get("zero_tail"), "truncated_tail": SYNTH_INFO.get("truncated_tail"),
+            "last_chunk_end": SYNTH_INFO.get("last_chunk_end"),
+            "measured_duration_sec": video_duration, "header_duration_sec": header_duration,
+        }, ensure_ascii=False))
+    if getattr(args, "slack", False):
+        # 슬랙 카빙은 원본(mm0)에서. 녹화 경계 뒤로 잘라낸 구간(옛 녹화 잔재·경계 불확실)도 슬랙으로 넘겨
+        # 본 궤적과 분리해 남긴다.
+        extra = []
+        if SYNTH_INFO.get("cut_at") is not None and active_path == input_path:
+            cut_end = movi_list[0].data_end if movi_list else len(mm)
+            if cut_end > SYNTH_INFO["cut_at"]:
+                kind = "after_cut_uncertain" if SYNTH_INFO.get("boundary_uncertain") else "after_cut_old_recording"
+                extra.append((kind, SYNTH_INFO["cut_at"], cut_end))
+        try:
+            run_slack_carve_avi(mm0, out_dir, dry_run=args.dry_run, extra_regions=extra)
+        except Exception as exc:
+            warn(f"슬랙 카빙 중 예외 - 정상 추출 결과에는 영향 없음: {exc}")
+    info(f"선택된 base 후보        : {base_label} (점수: {base_scores})")
+    info(f"발견된 스트림 수        : hdrl dwStreams={dw_streams} vs "
+         f"실제 관측={len(stream_table)}")
+    info(f"선택 모드/대상          : {select_mode} -> {sorted(selected_chunk_ids)!r}")
+    info(f"총 idx1 entry 개수      : {len(idx1_entries)}")
+    for s in selected_streams:
+        display_label = result["labels"][s.index][0]
+        ds = decode_summary.get(s.index, {})
+        kind = ds.get("kind")
+        if kind == "text":
+            extra = f", GPRMC/GPGGA 좌표 파싱 {ds.get('coord_count', 0)}개, 미분류 텍스트 {ds.get('unparsed_count', 0)}개"
+        elif kind == "record72":
+            extra = (f", FineVu 72바이트 레코드 {ds.get('coord_count', 0)}개 "
+                     f"(측위 성공 {ds.get('fix_count', 0)}개, 충격센서 {ds.get('sensor_count', 0)}개)")
+        elif kind == "float_vector":
+            extra = f", float 벡터(추정, 비공식) 파싱 {ds.get('sensor_count', 0)}개"
         else:
-            idx1_entries = parse_idx1(mm, idx1_start, idx1_size)
-
-        dw_streams, streams = (None, [])
-        if hdrl is not None:
-            dw_streams, streams = parse_hdrl(mm, hdrl)
-        else:
-            warn("hdrl 을 찾지 못함 - 스트림 타입 불명, chunk id 기반 fallback만 사용")
-
-        stream_table = build_stream_table(dw_streams, streams, idx1_entries)
-        print_stream_table(stream_table)
-
-        selected_chunk_ids = resolve_targets(
-            stream_table, select_mode, select_fcctypes, select_indices, select_chunk_ids)
-        selected_streams = [s for s in stream_table if s.selected]
-
-        opendml_info = detect_opendml(mm, movi_list, avix_count, stream_table)
-
-        base_offset, base_label, base_scores, base_uncertain = detect_base_offset(
-            mm, movi_fourcc_pos, idx1_entries)
-        info(f"\n[Base offset 선택] {base_label} -> base=0x{base_offset:X}"
-             f"{' (불확실)' if base_uncertain else ''}")
-
-        if not selected_streams:
-            warn("선택된 스트림이 없습니다. SELECT_MODE/조건을 확인하세요.")
-
-        # 재생 시간축: 텍스트 스트림 strh가 깨져 있는 기기가 많아 영상 스트림 길이를
-        # 레코드 수로 나눠 균등 간격을 만든다(자세한 근거는 compute_video_duration 참고).
-        video_duration, duration_source = compute_video_duration(mm, hdrl, stream_table)
-        if avix_count and video_duration:
-            first = first_riff_video_duration(stream_table, idx1_entries)
-            if first is not None and first[0] < video_duration:
-                video_duration, duration_source = first
-        if video_duration:
-            info(f"[시간축] 영상 길이 {video_duration:.3f}초 ({duration_source})")
-        else:
-            warn(f"[시간축] {duration_source} - start_time_sec 계열은 공란으로 둠")
-        entries_per_stream = {}
-        for e in idx1_entries:
-            sidx = stream_index_from_chunk_id(e["chunk_id"])
-            if sidx is not None:
-                entries_per_stream[sidx] = entries_per_stream.get(sidx, 0) + 1
-        stream_times = {}
-        for st in selected_streams:
-            n = entries_per_stream.get(st.index, 0)
-            stream_times[st.index] = build_avi_stream_times(video_duration, n)
-
-        # 72바이트 레코드 경로에서 레코드별 절대 시각(abs_time)을 만들려면 녹화 시작
-        # 시각이 필요한데, 이 계열은 그 값을 파일 안에 안 남기고 파일명에만 남긴다
-        # (뷰어도 날짜/시간을 파일명에서 가져온다).
-        start_dt = finevu_filename_start_time(input_path)
-        if start_dt is not None:
-            info(f"[시간축] 파일명 기준 녹화 시작 시각 {start_dt:%Y-%m-%d %H:%M:%S}")
-
-        result = extract_payload(
-            mm, out_dir, selected_streams, idx1_entries, base_offset,
-            dry_run=args.dry_run, stream_times=stream_times, start_dt=start_dt)
-
-        save_metadata(out_dir, result["index_rows"], stream_table,
-                       result["labels"], dry_run=args.dry_run)
-
-        decode_summary = write_decoded_outputs(
-            out_dir, selected_streams, result["labels"], result, dry_run=args.dry_run)
-
-        # GPS/센서를 재생 시각 기준 한 줄로 합친 통합 타임라인(시각화용).
-        n_timeline = write_avi_timeline(out_dir, selected_streams, result["labels"],
-                                         result, dry_run=args.dry_run, decode_summary=decode_summary)
-        if n_timeline:
-            info(f"[시간축] timeline.csv {n_timeline}행 생성")
-
-        info("\n" + "=" * 60)
-        info(f"[요약] {input_path}")
-        info(f"슬랙 리페어 적용 여부  : {'예 (' + work_path + ')' if work_path else '아니오'}")
-        info(f"movi offset            : 0x{movi_fourcc_pos:X} "
-             f"(발견된 movi 개수: {opendml_info['movi_count']})" if movi_fourcc_pos is not None
-             else "movi offset            : 없음")
-        info(f"idx1 offset             : {'(없음 - movi 걷기로 재구성)' if synthesized_index else f'0x{idx1_start:X}'}")
-        if DAMAGE_GAPS:
-            info("손상(건너뛴) 구간        : " + ", ".join(f"0x{a:X}-0x{b:X}" for a, b in DAMAGE_GAPS[:20]))
-            print("DAMAGE_JSON " + json.dumps({"gaps": DAMAGE_GAPS[:1000], "synthesized_index": synthesized_index}))
-        info(f"선택된 base 후보        : {base_label} (점수: {base_scores})")
-        info(f"발견된 스트림 수        : hdrl dwStreams={dw_streams} vs "
-             f"실제 관측={len(stream_table)}")
-        info(f"선택 모드/대상          : {select_mode} -> {sorted(selected_chunk_ids)!r}")
-        info(f"총 idx1 entry 개수      : {len(idx1_entries)}")
-        for s in selected_streams:
-            display_label = result["labels"][s.index][0]
-            ds = decode_summary.get(s.index, {})
-            kind = ds.get("kind")
-            if kind == "text":
-                extra = f", GPRMC/GPGGA 좌표 파싱 {ds.get('coord_count', 0)}개, 미분류 텍스트 {ds.get('unparsed_count', 0)}개"
-            elif kind == "record72":
-                extra = (f", FineVu 72바이트 레코드 {ds.get('coord_count', 0)}개 "
-                         f"(측위 성공 {ds.get('fix_count', 0)}개, 충격센서 {ds.get('sensor_count', 0)}개)")
-            elif kind == "float_vector":
-                extra = f", float 벡터(추정, 비공식) 파싱 {ds.get('sensor_count', 0)}개"
-            else:
-                extra = " (디코딩 안 됨 - raw만 보존)"
-            info(f"  - {display_label}(idx={s.index}): "
-                 f"{result['chunks_per_stream'][s.index]}개 chunk, "
-                 f"{result['bytes_per_stream'][s.index]} bytes{extra}")
-        info(f"검증 결과 (사유별)      : {result['validation_counts']}")
-        info(f"OpenDML/AVIX/indx/rec   : AVIX={opendml_info['avix_count']}, "
-             f"indx={opendml_info['has_indx']}, rec={opendml_info['has_rec']}")
-        info(f"경고 총 개수            : {len(WARNINGS)} "
-             f"({'dry-run이라 파일 미생성' if args.dry_run else os.path.join(out_dir, 'warnings.log') + ' 참조'})")
-        info("=" * 60)
-
-        mm.close()
+            extra = " (디코딩 안 됨 - raw만 보존)"
+        info(f"  - {display_label}(idx={s.index}): "
+             f"{result['chunks_per_stream'][s.index]}개 chunk, "
+             f"{result['bytes_per_stream'][s.index]} bytes{extra}")
+    info(f"검증 결과 (사유별)      : {result['validation_counts']}")
+    info(f"OpenDML/AVIX/indx/rec   : AVIX={opendml_info['avix_count']}, "
+         f"indx={opendml_info['has_indx']}, rec={opendml_info['has_rec']}")
+    info(f"경고 총 개수            : {len(WARNINGS)} "
+         f"({'dry-run이라 파일 미생성' if args.dry_run else os.path.join(out_dir, 'warnings.log') + ' 참조'})")
+    info("=" * 60)
 
 
 def parse_args(argv):

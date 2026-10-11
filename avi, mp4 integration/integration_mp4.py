@@ -48,10 +48,14 @@ class _GuardDictWriter(csv.DictWriter):
 
 
 def warn(msg):
+    if _QUIET_DEPTH[0]:
+        return
     WARNINGS.append(msg)
     print(f"[WARN] {msg}")
 
 def info(msg):
+    if _QUIET_DEPTH[0]:
+        return
     print(msg)
 
 def debug(msg):
@@ -113,6 +117,11 @@ def read_box_header(f, pos, limit, context="", allow_size_zero=False):
         if not allow_size_zero:
             warn(f"{context} Box {box_type!r} @ 0x{pos:X}: child Box에서 size==0이 나옴 "
                  f"(비정상 - size==0은 Top-Level에서만 '끝까지'라는 뜻이어야 함)")
+        elif box_type != b"mdat":
+            # size 0은 '파일 끝까지'인데 실제로 그렇게 쓰는 Box는 마지막 mdat뿐이다. ftyp/moof의 size 필드만
+            # 손상된 경우를 끝까지 Box로 읽으면 그 뒤 전체를 잃는다(리뷰 #65) - 손상으로 보고 재동기화에 맡긴다.
+            warn(f"{context} Box {box_type!r} @ 0x{pos:X}: size 0 - mdat가 아니라 '끝까지 Box'로 보지 않고 손상으로 봄")
+            return None
         size = limit - pos
     else:
         size = size32
@@ -899,6 +908,7 @@ class SampleMetadata:
     raw_data: bytes = b""
     parsed_segments: list = field(default_factory=list)
     error: Optional[str] = None
+    time_source: str = "tfdt_trun"   # 혼합 파일에서 moov 샘플 표로 읽은 샘플은 "stts"
 
 def parse_traf(f, traf_box, moof_start, moof_index, traf_index, text_track_id,
                timescale, trex_defaults, filesize, mdat_ranges,
@@ -1022,41 +1032,316 @@ def parse_moof(f, moof_box, moof_index, text_track_id, timescale, trex_defaults,
             prev_traf_data_end=prev_traf_data_end,
             track_dts_state=track_dts_state, out_samples=out_samples)
 
-def _moof_decode_times(f, moof_box):
-    """moof 안 traf마다 {track_id: tfdt baseMediaDecodeTime}. 못 읽으면 빈 dict."""
-    times = {}
+class _MoofProbe:
+    """moof 하나에서 읽은 연속성 정보. intact=False면 머리는 맞지만 내부(mfhd/traf/tfhd)를 읽을 수 없는 손상."""
+    __slots__ = ("intact", "mfhd", "times", "utc", "date")
+
+    def __init__(self):
+        self.intact = False
+        self.mfhd = None
+        self.times = {}      # {track_id: tfdt}
+        self.utc = None      # 첫 유효 GPS 문장의 UTC(초)
+        self.date = ""
+
+
+class _ScanContext:
+    """최상위 순회가 moov에서 한 번만 읽어 두는 정보(텍스트 트랙·timescale·trex·샘플 표 유무)."""
+    __slots__ = ("text_track_id", "timescale", "trex", "moov_seen", "flat_moov")
+
+    def __init__(self):
+        self.text_track_id = None
+        self.timescale = None
+        self.trex = {}
+        self.moov_seen = False
+        self.flat_moov = False   # mvex 없이 샘플 표가 채워진 moov(일반 MP4) - 그 뒤의 moof는 남의 것
+
+
+class _MoofState:
+    """지금까지 받은 현재 녹화 조각의 마지막 상태."""
+    __slots__ = ("mfhd", "times", "utc", "date", "count", "mfhd_reliable", "min_frag")
+
+    def __init__(self):
+        self.mfhd = None
+        self.times = {}
+        self.utc = None
+        self.date = ""
+        self.count = 0
+        self.mfhd_reliable = None   # 첫 두 조각이 +1로 이어졌는지(그래야 mfhd를 근거로 쓴다)
+        self.min_frag = None        # 받은 moof 사이 최소 간격(바이트) - 손상으로 사라진 조각 수 추정용
+
+    def update(self, probe, moof_box, prev_moof_start):
+        if self.count >= 1 and self.mfhd_reliable is None:
+            self.mfhd_reliable = (self.mfhd is not None and probe.mfhd == self.mfhd + 1)
+        if prev_moof_start is not None:
+            d = moof_box.start - prev_moof_start
+            if d > 0:
+                self.min_frag = d if self.min_frag is None else min(self.min_frag, d)
+        if probe.mfhd is not None:
+            self.mfhd = probe.mfhd
+        self.times.update(probe.times)
+        if probe.utc is not None:
+            self.utc = probe.utc
+            if probe.date:
+                self.date = probe.date
+        self.count += 1
+
+
+def _load_scan_context(f, moov_box, ctx):
+    ctx.moov_seen = True
     try:
-        for traf in find_all(list(iter_child_boxes(f, moof_box.payload_start, moof_box.end,
-                                                   context="boundary-moof")), b"traf"):
-            children = list(iter_child_boxes(f, traf.payload_start, traf.end, context="boundary-traf"))
-            tfhd_box, tfdt_box = find_box(children, b"tfhd"), find_box(children, b"tfdt")
-            if tfhd_box is None or tfdt_box is None:
-                continue
-            t = parse_tfdt(f, tfdt_box)
-            if t is not None:
-                times[parse_tfhd(f, tfhd_box).track_id] = t
+        text_tracks, trex, _all = _quietly(parse_moov, f, moov_box)
+        if text_tracks:
+            ctx.text_track_id = sorted(text_tracks)[0]
+            ctx.timescale = text_tracks[ctx.text_track_id].timescale
+        ctx.trex = trex or {}
+        children = list(iter_child_boxes(f, moov_box.payload_start, moov_box.end, context="scan-moov"))
+        if find_box(children, b"mvex") is None and _quietly(_moov_chunk_offsets, f, moov_box):
+            ctx.flat_moov = True
     except Exception:  # noqa: BLE001 - 경계 판단은 보조 정보라 실패해도 순회는 계속한다
-        return {}
-    return times
+        pass
 
 
-def scan_top_level_bounded(f, filesize):
+def _moov_chunk_offsets(f, moov_box):
+    """moov 안 모든 trak의 stco/co64 청크 위치. 샘플 표가 가리키는 mdat를 가려내는 데 쓴다."""
+    offsets = []
+    children = list(iter_child_boxes(f, moov_box.payload_start, moov_box.end, context="scan-moov"))
+    for trak_box in find_all(children, b"trak"):
+        mdia_box, _c = find_mdia(f, trak_box)
+        if mdia_box is None:
+            continue
+        minf_box, _c = find_minf(f, mdia_box)
+        if minf_box is None:
+            continue
+        stbl_box, _c = find_stbl(f, minf_box)
+        if stbl_box is None:
+            continue
+        stbl_children = list(iter_child_boxes(f, stbl_box.payload_start, stbl_box.end, context="scan-stbl"))
+        offs, _kind = parse_chunk_offsets(f, stbl_children)
+        offsets.extend(offs)
+    return offsets
+
+
+def _moof_probe(f, moof_box, filesize, ctx):
+    """moof의 mfhd 순번·tfdt·첫 유효 GPS(UTC·날짜)를 읽는다. 순회 경계 판단 전용(경고를 남기지 않음)."""
+    probe = _MoofProbe()
+    try:
+        children = list(_quietly(lambda: list(iter_child_boxes(f, moof_box.payload_start, moof_box.end,
+                                                                context="boundary-moof"))))
+        if not children or children[-1].end != moof_box.end:
+            return probe
+        mfhd_box = find_box(children, b"mfhd")
+        trafs = find_all(children, b"traf")
+        if mfhd_box is None or not trafs:
+            return probe
+        payload = read_payload(f, mfhd_box)
+        if len(payload) >= 8:
+            probe.mfhd = struct.unpack(">I", payload[4:8])[0]
+        for traf in trafs:
+            tchildren = list(_quietly(lambda: list(iter_child_boxes(f, traf.payload_start, traf.end,
+                                                                     context="boundary-traf"))))
+            if not tchildren or tchildren[-1].end != traf.end:
+                return probe
+            tfhd_box = find_box(tchildren, b"tfhd")
+            if tfhd_box is None:
+                return probe
+            tfhd = _quietly(parse_tfhd, f, tfhd_box)
+            if tfhd is None:
+                return probe
+            tfdt_box = find_box(tchildren, b"tfdt")
+            if tfdt_box is not None:
+                t = _quietly(parse_tfdt, f, tfdt_box)
+                if t is not None:
+                    probe.times[tfhd.track_id] = t
+        probe.intact = True
+        candidates = [ctx.text_track_id] if ctx.text_track_id is not None else sorted(probe.times)
+        for tid in candidates:
+            out = []
+            prev_end = None
+            for i, traf in enumerate(trafs):
+                prev_end = _quietly(parse_traf, f, traf, moof_box.start, 0, i, tid, ctx.timescale or 1000,
+                                    ctx.trex, filesize, [(0, filesize)], i == 0, prev_end, {}, out)
+            for s in out:
+                for kind, payload in s.parsed_segments:
+                    if (kind == "gps_nmea" and payload.get("checksum_ok") is True and payload.get("status_valid")
+                            and _utc_seconds(payload.get("utc_time") or "") is not None):
+                        probe.utc = _utc_seconds(payload["utc_time"])
+                        probe.date = payload.get("date", "") or ""
+                        break
+                if probe.utc is not None:
+                    break
+            if probe.utc is not None:
+                break
+    except Exception:  # noqa: BLE001
+        return probe
+    return probe
+
+
+UTC_BACKWARD_TOL_SEC = 5.0     # 같은 녹화 안에서 GPS UTC가 이보다 더 뒤로 가면 다른 녹화로 본다
+UTC_FORWARD_TOL_SEC = 60.0     # tfdt로 기대한 경과보다 이보다 더 앞서면 다른 녹화로 본다
+UTC_FORWARD_TOL_NO_TFDT_SEC = 3600.0
+
+
+def _moof_continuity(probe, state, ctx, allow_skip):
+    """probe(새 moof)가 state(마지막으로 받은 조각) 다음 조각으로 이어지는지. 반환 (ok, reasons)."""
+    reasons = []
+    if state.count == 0:
+        return True, reasons
+    if state.mfhd_reliable and state.mfhd is not None and probe.mfhd is not None:
+        if not (state.mfhd < probe.mfhd <= state.mfhd + 1 + allow_skip):
+            reasons.append("mfhd")
+    tfdt_bad = any(tid in state.times and t < state.times[tid] for tid, t in probe.times.items())
+    if tfdt_bad:
+        reasons.append("tfdt")
+    gps_strong = False
+    if probe.utc is not None and state.utc is not None:
+        du = probe.utc - state.utc
+        wrapped = du < -43200          # 자정 넘김(23:59:59 -> 00:00:00)이면 날짜가 바뀌는 게 정상
+        if wrapped:
+            du += 86400.0
+        if probe.date and state.date and probe.date != state.date and not wrapped:
+            reasons.append("date")
+        else:
+            expected = None
+            tid = ctx.text_track_id
+            if (not tfdt_bad and ctx.timescale and tid is not None
+                    and tid in probe.times and tid in state.times):
+                expected = (probe.times[tid] - state.times[tid]) / ctx.timescale
+            if du < -UTC_BACKWARD_TOL_SEC:
+                reasons.append("utc")
+            elif expected is not None and du > expected + UTC_FORWARD_TOL_SEC:
+                reasons.append("utc")
+            elif expected is None and du > UTC_FORWARD_TOL_NO_TFDT_SEC:
+                reasons.append("utc")
+            elif expected is not None and abs(du - expected) <= UTC_BACKWARD_TOL_SEC:
+                gps_strong = True
+    if reasons == ["mfhd"] and gps_strong:
+        # 순번만 어긋나고 tfdt·GPS가 기대대로 이어지면(손상으로 사라진 조각 수를 잘못 셌을 때) 받는다
+        return True, []
+    return (not reasons), reasons
+
+
+def _lookahead_moofs(f, start, filesize, ctx, max_moofs=2, max_boxes=12):
+    """start부터 Box 머리를 따라가며 다음 moof 몇 개의 probe를 모은다(ftyp/moov/깨진 머리에서 멈춤)."""
+    found = []
+    pos = start
+    n = 0
+    while pos < filesize and n < max_boxes and len(found) < max_moofs:
+        box = _quietly(read_box_header, f, pos, filesize, "lookahead", True)
+        if box is None or not all(0x20 <= b < 0x7F for b in box.box_type) or box.box_type in (b"ftyp", b"moov"):
+            break
+        if box.box_type == b"moof":
+            found.append((box, _moof_probe(f, box, filesize, ctx)))
+        pos = box.end
+        n += 1
+    return found
+
+
+_QUIET_DEPTH = [0]
+
+
+def _quietly(fn, *args, **kwargs):
+    """경계 판단용 보조 파싱은 경고를 남기지 않는다(같은 Box를 본 경로가 다시 읽으며 경고를 남긴다)."""
+    _QUIET_DEPTH[0] += 1
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _QUIET_DEPTH[0] -= 1
+
+
+def _region_all_zero(f, start, end, cancel_check=None):
+    pos = start
+    while pos < end:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("cancelled")
+        f.seek(pos)
+        chunk = f.read(min(4 * 1024 * 1024, end - pos))
+        if not chunk:
+            return False
+        if chunk.count(0) != len(chunk):
+            return False
+        pos += len(chunk)
+    return True
+
+
+# 선언 크기가 파일 끝을 넘어도 '잘린 현재 녹화'로 보는 Box 타입. 그 밖의 인쇄 가능한 4바이트(ASCII 꼬리 등)는
+# 손상/잔재로 보고 재동기화·슬랙 판정으로 넘긴다(리뷰 #65).
+_KNOWN_TOP_TYPES = {b"ftyp", b"moov", b"moof", b"mdat", b"free", b"skip", b"wide", b"styp", b"sidx",
+                    b"mfra", b"meta", b"uuid", b"udta", b"ICAT"}
+
+# 경계 뒤가 이어붙은 옛 녹화(슬랙)인 boundary_kind
+APPENDED_BOUNDARY_KINDS = ("ftyp", "tfdt", "moov", "moof", "mfhd", "gps")
+
+_SCAN_CACHE = {}
+_SCAN_CACHE_LIMIT = 8
+
+
+def _scan_cache_key(f, filesize):
+    try:
+        st = os.fstat(f.fileno())
+        return (getattr(f, "name", None), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, filesize)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def scan_top_level_bounded(f, filesize, cancel_check=None):
     """현재 녹화분의 최상위 Box 목록과 경계. 반환값: (boxes, boundary, boundary_kind).
 
     같은 저장매체에 예전 녹화 파일이 통째로 이어붙어 있으면(현재 파일이 선언한 끝 뒤에 두 번째
-    ftyp, 또는 tfdt가 되감기는 moof) 거기서 순회를 멈춘다. 예전엔 파일 끝까지 moof/moov를 모아
-    옛 녹화의 GPS가 같은 재생 시각에 섞이고 현재 녹화가 '위치 급변' 이상치로 빠졌다(리뷰 #2).
+    ftyp/moov, 또는 순번·tfdt·GPS가 이어지지 않는 moof) 거기서 순회를 멈춘다. 예전엔 파일 끝까지
+    moof/moov를 모아 옛 녹화의 GPS가 같은 재생 시각에 섞였다(리뷰 #2, 2026-10-11 #5).
+    재동기화로 찾은 Box도 mfhd 순번·tfdt 연속·GPS 날짜+UTC 연속이 맞을 때만 현재 녹화로 받는다.
+    tfdt 하나가 깨진 moof는 뒤 조각이 이어지면 그 moof만 손상(DAMAGE_GAPS)으로 처리한다(#64).
     boundary가 None이 아니면 그 뒤는 슬랙(옛 녹화)으로 다룬다. boundary_kind:
       "ftyp"      두 번째 ftyp
+      "moov"      두 번째 moov
+      "moof"      일반 MP4(샘플 표) 뒤에 남은 moof
       "tfdt"      같은 track의 tfdt가 앞 moof보다 작아짐(조각만 이어붙은 옛 녹화)
+      "mfhd"      mfhd 순번이 이어지지 않음
+      "gps"       GPS 날짜·UTC가 이어지지 않음
       "truncated" 헤더는 읽혔지만 선언 크기가 파일 끝을 넘는 Box(잘린 현재 녹화) - 슬랙이 아님
-      "corrupt"   Box 헤더를 읽을 수 없음
+      "corrupt"   Box 헤더를 읽을 수 없고 재동기화도 안 됨(DAMAGE_GAPS에 꼬리가 들어감)
+      "padding"   파일 끝까지 0으로 채워진 꼬리(사전 할당) - 손상도 슬랙도 아님
+    결과는 파일(dev/ino/size/mtime) 기준으로 캐시한다(#108). cancel_check()가 True를 돌려주면
+    InterruptedError로 중단한다.
     """
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("cancelled")
+    key = _scan_cache_key(f, filesize)
+    if key is not None and key in _SCAN_CACHE:
+        boxes, boundary, kind, gaps = _SCAN_CACHE[key]
+        DAMAGE_GAPS[:] = list(gaps)
+        return list(boxes), boundary, kind
+    result = _scan_top_level_uncached(f, filesize, cancel_check)
+    if key is not None:
+        if len(_SCAN_CACHE) >= _SCAN_CACHE_LIMIT:
+            _SCAN_CACHE.pop(next(iter(_SCAN_CACHE)))
+        _SCAN_CACHE[key] = (list(result[0]), result[1], result[2], list(DAMAGE_GAPS))
+    return result
+
+
+def _scan_top_level_uncached(f, filesize, cancel_check=None):
     boxes = []
-    last_times = {}
+    ctx = _ScanContext()
+    state = _MoofState()
+    prev_moof_start = None
+    anchor = None          # 재동기화 뒤 아직 moof로 확인되지 않은 구간: (boxes 길이, 손상 시작, 재동기화 위치)
+    allow_skip = 0         # 손상으로 사라졌을 수 있는 조각 수(mfhd 허용 폭)
     pos = 0
     DAMAGE_GAPS.clear()
+
+    def _boundary(at, kind):
+        # 재동기화 뒤에 받은 Box가 전부 남의 것이면 손상 시작점부터 통째로 슬랙(옛 녹화)이다.
+        if anchor is not None:
+            idx, gap_start, _resync_at = anchor
+            del boxes[idx:]
+            if DAMAGE_GAPS and DAMAGE_GAPS[-1][0] == gap_start:
+                DAMAGE_GAPS.pop()
+            return boxes, gap_start, kind
+        return boxes, at, kind
+
     while pos < filesize:
+        if cancel_check is not None and len(boxes) % 256 == 0 and cancel_check():
+            raise InterruptedError("cancelled")
         box = read_box_header(f, pos, filesize, context="top-level", allow_size_zero=True)
         if box is not None and not all(0x20 <= b < 0x7F for b in box.box_type):
             box = None
@@ -1064,31 +1349,77 @@ def scan_top_level_bounded(f, filesize):
             kind = "corrupt"
             if pos + 8 <= filesize:
                 f.seek(pos)
-                header = f.read(8)
+                header = f.read(16)
                 size32 = struct.unpack(">I", header[0:4])[0]
-                if all(0x20 <= b < 0x7F for b in header[4:8]) and size32 >= 8 and pos + size32 > filesize:
+                box_type = header[4:8]
+                declared = size32
+                if size32 == 1 and len(header) >= 16:
+                    declared = struct.unpack(">Q", header[8:16])[0]
+                if box_type in _KNOWN_TOP_TYPES and declared >= 8 and pos + declared > filesize:
                     kind = "truncated"
             if kind == "corrupt":
                 # 0으로 덮이거나 깨진 구간: 다음 정상 Box(moof/mdat/moov/ftyp…)를 찾아 이어 읽는다.
                 # 예전엔 여기서 멈춰 손상 뒤의 GPS·영상을 모두 버렸다(손상 시나리오 '중간 손상').
-                resync = resync_top_level(f, pos, filesize)
+                resync = resync_top_level(f, pos, filesize, cancel_check=cancel_check)
                 if resync is not None:
                     DAMAGE_GAPS.append((pos, resync))
                     warn(f"최상위 @ 0x{pos:X}: Box 머리를 읽을 수 없음 - 0x{resync:X}에서 재동기화 "
                          f"({resync - pos}바이트 건너뜀)")
+                    if anchor is None:
+                        anchor = (len(boxes), pos, resync)
+                    if state.min_frag:
+                        allow_skip += (resync - pos) // max(1, state.min_frag // 2) + 2
+                    else:
+                        allow_skip += 1_000_000
                     pos = resync
                     continue
+                if filesize - pos < 8 or _region_all_zero(f, pos, filesize, cancel_check):
+                    # 파일 끝까지 전부 0인 꼬리(사전 할당 잔여)는 손상이 아니다(리뷰 #66)
+                    return boxes, pos, "padding"
                 DAMAGE_GAPS.append((pos, filesize))
             return boxes, pos, kind
         if box.box_type == b"ftyp" and box.start > 0:
             warn(f"최상위 @ 0x{box.start:X}: 두 번째 ftyp - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
-            return boxes, box.start, "ftyp"
+            return _boundary(box.start, "ftyp")
+        if box.box_type == b"moov":
+            if ctx.moov_seen:
+                warn(f"최상위 @ 0x{box.start:X}: 두 번째 moov - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
+                return _boundary(box.start, "moov")
+            _load_scan_context(f, box, ctx)
         if box.box_type == b"moof":
-            times = _moof_decode_times(f, box)
-            if any(tid in last_times and t < last_times[tid] for tid, t in times.items()):
-                warn(f"moof @ 0x{box.start:X}: tfdt가 앞 조각보다 작아짐 - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
-                return boxes, box.start, "tfdt"
-            last_times.update(times)
+            if ctx.flat_moov:
+                warn(f"moof @ 0x{box.start:X}: 샘플 표로 된 일반 MP4 뒤에 남은 moof - 이어붙은 옛 녹화로 보고 순회를 멈춤")
+                return _boundary(box.start, "moof")
+            probe = _moof_probe(f, box, filesize, ctx)
+            if not probe.intact:
+                # 머리는 맞지만 내부(mfhd/traf/tfhd)를 읽을 수 없는 moof: 손상 구간으로 두고 그 mdat는 카빙 대상(리뷰 #68)
+                DAMAGE_GAPS.append((box.start, box.end))
+                warn(f"moof @ 0x{box.start:X}: 내부(mfhd/traf)를 읽을 수 없음 - 손상 구간으로 두고 뒤의 mdat는 GPS 문장만 되돌려 넣음")
+                allow_skip += 1
+                pos = box.end
+                continue
+            ok, reasons = _moof_continuity(probe, state, ctx, allow_skip)
+            if not ok:
+                # 뒤 조각이 마지막으로 받은 조각과 이어지면 이 moof 하나만 손상이다(리뷰 #64).
+                isolated = False
+                for j, (_nb, nprobe) in enumerate(_lookahead_moofs(f, box.end, filesize, ctx)):
+                    if nprobe.intact and _moof_continuity(nprobe, state, ctx, allow_skip + 1 + j)[0]:
+                        isolated = True
+                        break
+                if isolated:
+                    DAMAGE_GAPS.append((box.start, box.end))
+                    warn(f"moof @ 0x{box.start:X}: {'/'.join(reasons)}가 앞 조각과 이어지지 않지만 뒤 조각은 이어짐 "
+                         f"- 이 moof만 손상으로 두고 뒤의 mdat는 GPS 문장만 되돌려 넣음")
+                    allow_skip += 1
+                    pos = box.end
+                    continue
+                kind = "tfdt" if "tfdt" in reasons else ("mfhd" if "mfhd" in reasons else "gps")
+                warn(f"moof @ 0x{box.start:X}: {'/'.join(reasons)}가 앞 조각과 이어지지 않음 - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
+                return _boundary(box.start, kind)
+            state.update(probe, box, prev_moof_start)
+            prev_moof_start = box.start
+            anchor = None
+            allow_skip = 0
         boxes.append(box)
         pos = box.end
     return boxes, None, None
@@ -1103,6 +1434,7 @@ def scan_top_level(f, filesize):
 CURRENT_INPUT_PATH = None   # process_single_file이 설정. 손상 구간 GPS 카빙이 파일을 다시 연다.
 DAMAGE_GAPS = []        # [(start, end)] 최상위 순회에서 읽을 수 없어 건너뛴 구간
 UNINDEXED_MEDIA = []    # [(start, end)] 앞의 moof가 사라져 샘플 표 없이 남은 mdat 페이로드
+CARVED_GPS_OFFSETS = set()   # 손상 구간에서 본 궤적으로 되돌려 넣은 GPS 문장의 파일 위치(슬랙과 중복 금지)
 _TOP_SIGNATURE = re.compile(rb"moof|mdat|moov|ftyp|free|skip|styp")
 
 
@@ -1136,13 +1468,18 @@ def _plausible_box_at(f, pos, filesize):
     return pos + size
 
 
-def resync_top_level(f, start, filesize):
+def resync_top_level(f, start, filesize, cancel_check=None):
     """start 뒤에서 '머리가 맞고 그 다음 Box 머리도 맞는(또는 파일 끝에 닿는)' 최상위 Box 위치를 찾는다."""
     pos = start + 1
     window = 4 * 1024 * 1024
     while pos + 8 <= filesize:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("cancelled")
         f.seek(pos)
         buf = f.read(window + 8)
+        if buf.count(0) == len(buf):
+            pos += window
+            continue
         for m in _TOP_SIGNATURE.finditer(buf):
             cand = pos + m.start() - 4
             if cand < start + 1:
@@ -1306,6 +1643,14 @@ def save_track_table(out_dir, all_tracks, target_track_id, sample_count):
         })
     write_csv(os.path.join(out_dir, "track_table.csv"), rows)
 
+def _gps_rank(payload):
+    """한 sample에 GPS 문장이 여럿일 때 대표를 고르는 우선순위(AVI 엔진 find_embedded_nmea_text와 같은 순서):
+    체크섬 맞는 RMC > 체크섬 맞는 GGA > 체크섬 없는 RMC > 체크섬 없는 GGA > 체크섬 틀린 RMC > 틀린 GGA
+    (리뷰 #8: RMC가 속도·날짜를 가짐, 2026-10-11 #107: 체크섬 틀린 RMC가 정상 GGA를 밀어내면 안 됨)."""
+    ok = payload.get("checksum_ok")
+    return (ok is True, ok is not False, payload.get("sentence_type") == "RMC")
+
+
 def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
     if dry_run:
         return
@@ -1340,16 +1685,15 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
         for kind, payload in s.parsed_segments:
             if kind == "gps_nmea":
                 # sample 하나에 RMC 뒤에 GGA가 오면 마지막 문장(GGA)이 대표가 되어 timeline의
-                # 속도·날짜가 사라졌다(리뷰 #8). 속도·날짜를 가진 RMC가 있으면 그것을 대표로 둔다.
-                if gps_payload is None or (payload.get("sentence_type") == "RMC"
-                                           and gps_payload.get("sentence_type") != "RMC"):
+                # 속도·날짜가 사라졌다(리뷰 #8). 체크섬이 맞는 문장 중 RMC를 대표로 둔다(#107).
+                if gps_payload is None or _gps_rank(payload) > _gps_rank(gps_payload):
                     gps_payload = payload
                 speed_kmh = payload.get("speed_kmh")
                 coord_rows.append({
                     "sample": s.sample_index,
                     "start_time_sec": f"{s.start_time:.3f}" if s.start_time is not None else "",
                     "end_time_sec": f"{s.end_time:.3f}" if s.end_time is not None else "",
-                    "time_source": "tfdt_trun" if s.start_time is not None else "",
+                    "time_source": s.time_source if s.start_time is not None else "",
                     "date": payload.get("date", ""), "utc_time": payload.get("utc_time", ""),
                     "status": payload.get("status", ""),
                     "latitude": f"{payload['lat']:.6f}" if payload.get("lat") is not None else "",
@@ -1373,7 +1717,7 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
                     "sample": s.sample_index,
                     "start_time_sec": f"{s.start_time:.3f}" if s.start_time is not None else "",
                     "end_time_sec": f"{s.end_time:.3f}" if s.end_time is not None else "",
-                    "time_source": "tfdt_trun" if s.start_time is not None else "",
+                    "time_source": s.time_source if s.start_time is not None else "",
                     "absolute_offset": f"0x{s.file_offset:08X}" if s.file_offset >= 0 else "",
                     "subtype": payload.get("subtype", ""),
                     "count": payload.get("count"),
@@ -1407,7 +1751,7 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
             "sample": s.sample_index,
             "start_time_sec": f"{s.start_time:.3f}" if s.start_time is not None else "",
             "end_time_sec": f"{s.end_time:.3f}" if s.end_time is not None else "",
-            "time_source": "tfdt_trun" if s.start_time is not None else "",
+            "time_source": s.time_source if s.start_time is not None else "",
             "source_offset": s.file_offset if s.file_offset >= 0 else "",
             "latitude": (f"{gps_payload['lat']:.6f}"
                          if gps_payload and gps_payload.get("lat") is not None else ""),
@@ -1444,7 +1788,13 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
             row["y_g_cal"] = sen.get("y_g_cal", "")
             row["z_g_cal"] = sen.get("z_g_cal", "")
     # moof가 사라져 샘플 표가 없는 구간·손상 구간에 남은 GPS 문장을 UTC로 시간축에 되돌려 넣는다(손상 복구).
-    carved = carve_gap_gps(CURRENT_INPUT_PATH, DAMAGE_GAPS + UNINDEXED_MEDIA, timeline_rows)
+    # 재동기화도 안 되는 EOF 꼬리(0/옛 잔재)는 슬랙으로만 둔다 - 옛 RMC가 본 궤적에 들어갔다(리뷰 2026-10-11 #6).
+    try:
+        _fsize = os.path.getsize(CURRENT_INPUT_PATH) if CURRENT_INPUT_PATH else None
+    except OSError:
+        _fsize = None
+    gaps = [g for g in DAMAGE_GAPS if _fsize is None or g[1] < _fsize]
+    carved = carve_gap_gps(CURRENT_INPUT_PATH, gaps + UNINDEXED_MEDIA, timeline_rows)
     if carved:
         timeline_rows.extend(carved)
         timeline_rows.sort(key=lambda r: (r.get("start_time_sec") == "", float(r.get("start_time_sec") or 0)))
@@ -1925,22 +2275,33 @@ def carve_gap_gps(path, regions, timeline_rows):
 
 
 def _carve_gap_gps(f, regions, timeline_rows):
+    """회수 규칙(리뷰 2026-10-11 #6): 체크섬이 맞는 정상 행만 앵커로 쓰고, 문장의 날짜가 앵커의 날짜와 같고,
+    재생 시각이 바이트상 앞뒤 앵커 사이이며 0초~영상 길이 안일 때만 받는다. 그 밖은 슬랙 카빙에 맡긴다."""
     anchors = []
+    duration = 0.0
     for r in timeline_rows:
-        u = _utc_seconds(r.get("gps_utc_time") or "")
         try:
             t = float(r.get("start_time_sec") or "")
         except ValueError:
             continue
+        try:
+            duration = max(duration, float(r.get("end_time_sec") or t))
+        except ValueError:
+            duration = max(duration, t)
+        if r.get("gps_checksum_ok") in (False, "False"):
+            continue
+        u = _utc_seconds(r.get("gps_utc_time") or "")
         off = r.get("source_offset")
         if u is not None and off not in ("", None):
-            anchors.append((int(off), t, u))
+            anchors.append((int(off), t, u, r.get("gps_date", "") or ""))
     if len(anchors) < 2:
         return []
     anchors.sort()
+    anchor_dates = {a[3] for a in anchors if a[3]}
     seen = {(r.get("gps_date", ""), r.get("gps_utc_time", "")) for r in timeline_rows if r.get("gps_utc_time")}
     template = {k: "" for k in timeline_rows[0].keys()}
     out = []
+    rejected = 0
     for start, end in regions:
         pos = start
         while pos < end:
@@ -1961,18 +2322,28 @@ def _carve_gap_gps(f, regions, timeline_rows):
                 u = _utc_seconds(parsed.get("utc_time", ""))
                 if u is None:
                     continue
+                date = parsed.get("date", "") or ""
+                if anchor_dates and date and date not in anchor_dates:
+                    rejected += 1
+                    continue
                 abs_off = pos + m.start()
-                # 가장 가까운(바이트 위치 기준) 앵커로 재생 시각을 정한다. 자정 넘김은 ±12시간으로 보정.
-                anchor = min(anchors, key=lambda a: abs(a[0] - abs_off))
-                du = u - anchor[2]
+                prev_a = next((a for a in reversed(anchors) if a[0] < abs_off), None)
+                next_a = next((a for a in anchors if a[0] > abs_off), None)
+                base = prev_a if prev_a is not None else next_a
+                du = u - base[2]
                 if du > 43200:
                     du -= 86400
                 elif du < -43200:
                     du += 86400
-                t = anchor[1] + du
-                if t < 0:
+                t = base[1] + du
+                lo = prev_a[1] if prev_a is not None else 0.0
+                hi = next_a[1] if next_a is not None else duration + 1.0
+                if t < -0.5 or t > duration + 1.0 or t < lo - 0.5 or t > hi + 0.5:
+                    rejected += 1
                     continue
+                t = max(t, 0.0)
                 seen.add(key)
+                CARVED_GPS_OFFSETS.add(abs_off)
                 row = dict(template)
                 speed = parsed.get("speed_kmh")
                 row.update({
@@ -1989,6 +2360,8 @@ def _carve_gap_gps(f, regions, timeline_rows):
             pos += len(chunk) - 256   # 블록 경계에 걸친 문장을 놓치지 않게 겹쳐 읽는다
     if out:
         warn(f"손상 구간에서 GPS 문장 {len(out)}건을 UTC 기준으로 되돌려 넣음(gap_carved_utc)")
+    if rejected:
+        warn(f"손상 구간의 GPS 문장 {rejected}건은 날짜·앞뒤 시각·영상 길이와 맞지 않아 본 궤적에 넣지 않음(슬랙 카빙 대상)")
     return out
 
 
@@ -2159,9 +2532,8 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
             elif kind == "gps_nmea":
                 parsed = payload
                 speed_kmh = parsed.get("speed_kmh")
-                if timeline_gps is None or (parsed.get("sentence_type") == "RMC"
-                                            and timeline_gps.get("sentence_type") != "RMC"):
-                    timeline_gps = parsed   # RMC 우선(리뷰 #8)
+                if timeline_gps is None or _gps_rank(parsed) > _gps_rank(timeline_gps):
+                    timeline_gps = parsed   # 체크섬 맞는 RMC 우선(리뷰 #8, #107)
                 coord_rows.append({
                     "sample": s.sample_number,
                     "start_time_sec": _fmt_sec(start_sec),
@@ -2472,6 +2844,39 @@ def probe_container(f, filesize):
 
 
 # ---- 여기부터: 이 파일 고유 - 루트별 실행부 ----
+def _hybrid_moov_samples(f, moov_box, target_track_id, filesize, mdat_ranges):
+    """moov 샘플 표에 든 대상 text 트랙 샘플을 SampleMetadata(time_source='stts')로 읽는다. 없으면 []."""
+    out = []
+    try:
+        moov_children = list(iter_child_boxes(f, moov_box.payload_start, moov_box.end, context="moov-hybrid"))
+        for n, trak_box in enumerate(find_all(moov_children, b"trak"), start=1):
+            track_id = _quietly(parse_trak, f, trak_box)[0]
+            if track_id != target_track_id:
+                continue
+            ti = parse_track(f, trak_box, n)
+            if not (ti.is_text_track and ti.samples):
+                continue
+            for s in ti.samples:
+                start_sec, end_sec = sample_time_range(ti, s.sample_number)
+                sm = SampleMetadata(
+                    track_id=track_id, moof_index=-1, traf_index=-1, trun_index=-1,
+                    sample_index=len(out) + 1, file_offset=s.absolute_offset, size=s.size,
+                    dts=int(round(start_sec * ti.timescale)) if (start_sec is not None and ti.timescale) else 0,
+                    duration=(int(round((end_sec - start_sec) * ti.timescale))
+                              if (start_sec is not None and end_sec is not None and ti.timescale) else None),
+                    composition_time_offset=None, start_time=start_sec, end_time=end_sec, time_source="stts")
+                raw, err = extract_sample(f, s.absolute_offset, s.size, filesize, mdat_ranges)
+                if err is not None:
+                    sm.error = err
+                else:
+                    sm.raw_data = raw
+                    sm.parsed_segments, _ = parse_atext_metadata(raw)
+                out.append(sm)
+    except Exception as exc:  # noqa: BLE001
+        warn(f"moov sample table 확인 실패: {exc}")
+    return out
+
+
 def run_fragmented(f, filesize, out_dir, args):
     """루트 A - GPS_metadata_fragment_iso4_Atext.py 의 main과 동일한 호출 순서."""
     top_boxes = scan_top_level(f, filesize)
@@ -2487,9 +2892,16 @@ def run_fragmented(f, filesize, out_dir, args):
         return None
 
     # 앞의 moof가 사라진 mdat(손상): 샘플 표가 없어 정상 경로로는 못 읽는다. GPS 문장 카빙 대상으로 남긴다.
+    # moov의 샘플 표(stco/co64)가 가리키는 mdat(혼합 파일의 앞 구간)는 손상이 아니다(리뷰 2026-10-11 #67).
     UNINDEXED_MEDIA.clear()
+    try:
+        moov_offsets = _quietly(_moov_chunk_offsets, f, moov_boxes[0])
+    except Exception:  # noqa: BLE001
+        moov_offsets = []
     for i, b in enumerate(top_boxes):
         if b.box_type == b"mdat" and (i == 0 or top_boxes[i - 1].box_type != b"moof"):
+            if any(b.payload_start <= o < b.end for o in moov_offsets):
+                continue
             UNINDEXED_MEDIA.append((b.payload_start, b.end))
     if UNINDEXED_MEDIA:
         warn(f"moof 없이 남은 mdat {len(UNINDEXED_MEDIA)}개 - 샘플 표 없이 GPS 문장만 UTC로 되돌려 넣음")
@@ -2498,18 +2910,6 @@ def run_fragmented(f, filesize, out_dir, args):
     if not text_tracks:
         warn("text/sbtl/subt handler를 가진 Track을 찾지 못함")
         return None
-    # 혼합(hybrid) 파일: moov의 sample table에도 sample이 있으면(첫 구간) 이 경로는 moof만 읽어
-    # 그 구간이 빠진다. 조용히 넘어가지 않고 경고로 남긴다(리뷰 #23).
-    try:
-        moov_children = list(iter_child_boxes(f, moov_boxes[0].payload_start, moov_boxes[0].end,
-                                               context="moov-hybrid"))
-        for n, trak_box in enumerate(find_all(moov_children, b"trak"), start=1):
-            ti = parse_track(f, trak_box, n)
-            if ti.is_text_track and ti.samples:
-                warn(f"moov sample table에 text sample {len(ti.samples)}개가 있음(혼합 파일) - fragmented "
-                     f"경로는 moof만 읽으므로 그 구간(앞부분)의 GPS가 누락됨")
-    except Exception as exc:  # noqa: BLE001
-        warn(f"moov sample table 확인 실패: {exc}")
 
     if args.track_id is not None:
         if args.track_id not in text_tracks:
@@ -2522,11 +2922,19 @@ def run_fragmented(f, filesize, out_dir, args):
     target = text_tracks[target_track_id]
     info(f"\n대상 text Track: track_ID={target.track_id} timescale={target.timescale}")
 
+    # 혼합(hybrid) 파일: moov의 sample table에도 sample이 있으면(첫 구간) 샘플 표로 읽어 앞에 합친다.
+    # 예전엔 moof만 읽어 그 구간이 빠지거나(리뷰 #23) 그 mdat를 손상 구간 회수로 표시했다(2026-10-11 #67).
+    out_samples = _hybrid_moov_samples(f, moov_boxes[0], target_track_id, filesize, mdat_ranges)
+    if out_samples:
+        warn(f"moov sample table에 text sample {len(out_samples)}개가 있음(혼합 파일) - 샘플 표(stts)로 읽어 "
+             f"moof 조각 앞에 합침")
+
     track_dts_state = {}
-    out_samples = []
     for moof_index, moof_box in enumerate(moof_boxes):
         parse_moof(f, moof_box, moof_index, target_track_id, target.timescale,
                     trex_defaults, filesize, mdat_ranges, track_dts_state, out_samples)
+    for n, s in enumerate(out_samples, start=1):
+        s.sample_index = n
     info(f"\n총 {len(out_samples)}개 text Track sample 발견")
 
     printed = 0
@@ -2625,7 +3033,10 @@ UTC_MIDNIGHT_MIN_DROP_SEC = 43200.0
 
 def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
     """coord_rows에 start_time_sec/end_time_sec/time_source를 채운다.
-    첫 문장의 UTC가 0초. 자정을 넘어가면 하루(86400초)를 더해 이어붙인다."""
+    첫 문장의 UTC가 0초. 자정을 넘어가면 하루(86400초)를 더해 이어붙인다.
+    체크섬이 깨진 문장은 시각으로 믿지 않는다: 그 값이 위로 튀면 이후 전 구간이 자정 넘김으로 오인돼
+    86400초가 더해졌다(리뷰 #55, 2026-10-11 #69). 자정 넘김·날짜·기준 시각 판정 전체에서 빼고 그 행의
+    재생 시각은 비워 둔다(UTC 없는 행과 같은 취급)."""
     base = None
     prev = None
     prev_date = None
@@ -2634,16 +3045,14 @@ def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
     leading_missing = 0   # UTC 없는 선두 문장 수(측위 전 V 문장 등). 첫 UTC 문장이 영상 0초가 아니다(리뷰 #9)
     for row in coord_rows:
         secs = _utc_to_seconds(row.get("utc_time"))
-        if secs is None:
+        trusted_time = row.get("checksum_ok") is not False
+        if secs is None or not trusted_time:
             row["start_time_sec"] = ""
             row["end_time_sec"] = ""
             row["time_source"] = ""
             if base is None:
                 leading_missing += 1
             continue
-        # 체크섬이 깨진 문장은 시각으로 믿지 않는다: 그 값이 위로 튀면 이후 전 구간이 자정 넘김으로
-        # 오인돼 86400초가 더해졌다(리뷰 #55). 시간축 기준(prev/base)은 정상 문장으로만 세운다.
-        trusted_time = row.get("checksum_ok") is not False
         date = row.get("date") or ""
         if prev is not None:
             drop = prev - (secs + carry)
@@ -2659,15 +3068,14 @@ def assign_utc_elapsed_times(coord_rows, nominal_interval=1.0):
                 warn(f"GPS UTC가 {drop:.3f}초 뒤로 감 (utc_time={row.get('utc_time')!r}) "
                      f"- 자정 넘김이 아니라 중복/순서 뒤바뀜으로 보고 시간축을 그대로 둠")
         value = secs + carry
-        if trusted_time:
-            # 한 번 튄 값 때문에 이후 비교 기준이 낮아지지 않도록 최댓값을 유지한다.
-            prev = value if prev is None else max(prev, value)
-            if date:
-                prev_date = date
+        # 한 번 튄 값 때문에 이후 비교 기준이 낮아지지 않도록 최댓값을 유지한다.
+        prev = value if prev is None else max(prev, value)
+        if date:
+            prev_date = date
         if base is None:
             base = value - leading_missing * nominal_interval
             if leading_missing:
-                warn(f"첫 {leading_missing}개 문장에 UTC가 없어 영상 0초를 '첫 UTC 시각 - "
+                warn(f"첫 {leading_missing}개 문장에 UTC가 없거나 체크섬이 깨져 영상 0초를 '첫 정상 UTC 시각 - "
                      f"{leading_missing * nominal_interval:.0f}초'로 잡음")
         start = value - base
         row["start_time_sec"] = f"{start:.3f}"
@@ -2816,9 +3224,10 @@ def find_slack_regions(f, filesize):
     # 슬랙, 잘린 현재 Box(truncated)면 슬랙이 아니라 '잘림'이다 - 현재 녹화의 마지막 조각이 슬랙에
     # 중복으로 들어가던 문제(리뷰 #34).
     boxes, boundary, boundary_kind = scan_top_level_bounded(f, filesize)
-    appended_at = boundary if boundary_kind in ("ftyp", "tfdt") else None
+    appended_at = boundary if boundary_kind in APPENDED_BOUNDARY_KINDS else None
     truncated_at = boundary if boundary_kind == "truncated" else None
     corrupt_at = boundary if boundary_kind == "corrupt" else None
+    padding_at = boundary if boundary_kind == "padding" else None
 
     prev_end = 0
     for box in boxes:
@@ -2835,6 +3244,8 @@ def find_slack_regions(f, filesize):
         info(f"[슬랙] 0x{truncated_at:08X} 부터는 잘린 현재 녹화 Box - 슬랙으로 보지 않음")
     elif corrupt_at is not None:
         regions.append(("trailing", corrupt_at, filesize))
+    elif padding_at is not None:
+        info(f"[슬랙] 0x{padding_at:08X} 부터는 파일 끝까지 0으로 채워진 꼬리(사전 할당) - 카빙 대상 없음")
     elif prev_end < filesize:
         regions.append(("trailing", prev_end, filesize))
 
@@ -2852,7 +3263,8 @@ def carve_region(raw, start, end, region_kind):
     for pattern in (SLACK_NMEA_RE, SLACK_GSENSOR_RE):
         for m in pattern.finditer(raw, start, end):
             off = m.start()
-            if off in found:
+            if off in found or off in CARVED_GPS_OFFSETS:
+                # 손상 구간에서 본 궤적으로 되돌려 넣은 문장은 슬랙에 다시 넣지 않는다(리뷰 2026-10-11 #24)
                 continue
             text = m.group().decode("ascii", errors="replace")
             segments = split_segments(text)
@@ -3029,6 +3441,7 @@ def process_single_file(input_path, output_root, args):
     global CURRENT_INPUT_PATH
     CURRENT_INPUT_PATH = input_path
     WARNINGS.clear()
+    CARVED_GPS_OFFSETS.clear()
     info("=" * 70)
     info(f"[처리 시작] {input_path}")
 

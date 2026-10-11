@@ -53,6 +53,9 @@ ISO_BMFF_LEADING_BOXES = {b"moov", b"mdat", b"moof", b"free", b"skip", b"wide", 
 EXTENSION_HINT = {".avi": CONTAINER_AVI, ".mp4": CONTAINER_MP4, ".m4v": CONTAINER_MP4,
                   ".mov": CONTAINER_MP4}
 
+# AVI가 아닌 것이 확실한 RIFF 형식. 이 밖의 formType(0 채움·깨진 값)은 내용으로 판별한다(리뷰 #120).
+KNOWN_OTHER_RIFF_FORMS = {b"WAVE", b"WEBP", b"RMID", b"CDXA", b"ACON", b"PAL ", b"RDIB", b"RMMP", b"DLS ", b"sfbk"}
+
 
 def detect_container(path):
     """파일 앞부분 시그니처로 컨테이너를 판별한다.
@@ -71,8 +74,16 @@ def detect_container(path):
         form = head[8:12]
         if form == b"AVI ":
             return CONTAINER_AVI, None
-        return None, (f"RIFF이지만 formType이 {form.decode('ascii', errors='replace')!r} "
-                      f"- AVI가 아니라 처리 대상이 아님")
+        if form in KNOWN_OTHER_RIFF_FORMS:
+            return None, (f"RIFF이지만 formType이 {form.decode('ascii', errors='replace')!r} "
+                          f"- AVI가 아니라 처리 대상이 아님")
+        # formType만 깨진 AVI(8~11바이트 손상)는 내용으로 판별한다. 예전엔 여기서 거부돼 데이터가 전부 남은
+        # 파일이 'AVI가 아님'이 됐다(리뷰 #120). 알려진 다른 RIFF 형식만 위에서 거부한다.
+        sniffed, evidence = sniff_damaged_container(path)
+        if sniffed == CONTAINER_AVI:
+            return CONTAINER_AVI, f"RIFF formType 손상: {form!r} - 파일 내용({evidence})으로 AVI로 판별"
+        return None, (f"RIFF이지만 formType이 {form.decode('ascii', errors='replace')!r} 이고 "
+                      f"내용에서도 AVI 구조를 찾지 못함 - 처리 대상이 아님")
 
     box_type = head[4:8]
     if box_type == b"ftyp":
@@ -117,6 +128,15 @@ def sniff_damaged_container(path, window=8 * 1024 * 1024):
         chunk_ids = re.findall(rb"[0-9]{2}(?:dc|db|wb)", head)
         if not avi_hits and len(chunk_ids) >= 8:
             avi_hits.append(f"{len(chunk_ids)}개 AVI 청크 머리")
+        if not avi_hits and filesize > window:
+            # 앞 8MB가 통째로 0인 큰 AVI: idx1은 파일 끝에 있으니 뒤 8MB도 본다(리뷰 #80).
+            f.seek(max(window, filesize - window))
+            tail = f.read(window)
+            m = re.search(rb"idx1", tail)
+            if m:
+                avi_hits.append(f"idx1@0x{max(window, filesize - window) + m.start():X}")
+            elif len(re.findall(rb"[0-9]{2}(?:dc|db|wb)", tail)) >= 8:
+                avi_hits.append("뒤 8MB에 AVI 청크 머리")
 
         def box_end(pos):
             if pos < 0 or pos + 8 > filesize:
@@ -155,7 +175,8 @@ def sniff_damaged_container(path, window=8 * 1024 * 1024):
             tail_start = max(window - 8, filesize - window)
             f.seek(tail_start)
             mp4_hit = find_chain(tail_start, f.read(window))
-        if mp4_hit is None and filesize > 2 * window:
+        if mp4_hit is None and filesize > 2 * window and not avi_hits:
+            # AVI 근거가 이미 있으면 파일 전체 MP4 탐색은 생략한다(리뷰 #108).
             pos = window - 8
             while pos < filesize - window and mp4_hit is None:
                 f.seek(pos)
@@ -169,6 +190,14 @@ def sniff_damaged_container(path, window=8 * 1024 * 1024):
         avi_pos = int(avi_hits[0].rsplit("0x", 1)[-1], 16) if "0x" in avi_hits[0] else 0
         return (CONTAINER_AVI if avi_pos < mp4_hit[1] else CONTAINER_MP4), f"{', '.join(avi_hits)} / {mp4_hit[0]}"
     return None, ""
+
+class _SharedReservations(set):
+    """integration_avi/mp4가 공유하는 출력 폴더 예약 집합. 각 모듈 main()의 clear()를 무시해 앞 모듈이 예약한
+    폴더가 뒤 모듈에서 다시 쓰이지 않게 한다. 배치(블랙박스 main) 한 번마다 새로 만든다."""
+
+    def clear(self):
+        pass
+
 
 def check_extension_mismatch(path, container):
     """확장자와 실제 내용이 다르면 알려준다(판별은 내용을 따른다)."""
@@ -215,6 +244,45 @@ def parse_args(argv):
     args.avi_opt = [tok for chunk in args.avi_opt for tok in shlex.split(chunk)]
     args.mp4_opt = [tok for chunk in args.mp4_opt for tok in shlex.split(chunk)]
     return args
+
+
+def _run_groups(args, groups, results):
+    """판별된 AVI/MP4 묶음을 각 통합 스크립트에 넘긴다(출력 폴더 예약은 main()이 공유 집합으로 묶는다)."""
+    if groups[CONTAINER_AVI]:
+        print(f"\n{'#' * 70}\n# AVI {len(groups[CONTAINER_AVI])}개 -> integration_avi.py\n{'#' * 70}")
+        argv_avi = ["-o", args.output]
+        if args.dry_run:
+            argv_avi.append("--dry-run")
+        if args.slack:
+            argv_avi.append("--slack")
+        argv_avi += args.avi_opt + groups[CONTAINER_AVI]
+        try:
+            integration_avi.main(argv_avi)
+            results.append(("AVI", len(groups[CONTAINER_AVI]), None))
+        except SystemExit as exc:
+            # integration_avi.assert_riff_file 등이 sys.exit을 부를 수 있다.
+            # 여기서 잡아야 뒤이은 MP4 처리가 같이 죽지 않는다.
+            results.append(("AVI", len(groups[CONTAINER_AVI]),
+                            f"integration_avi.py가 종료 코드 {exc.code}로 중단됨"))
+        except Exception as exc:
+            results.append(("AVI", len(groups[CONTAINER_AVI]), f"예외: {exc}"))
+
+    if groups[CONTAINER_MP4]:
+        print(f"\n{'#' * 70}\n# MP4 {len(groups[CONTAINER_MP4])}개 -> integration_mp4.py\n{'#' * 70}")
+        argv_mp4 = ["-o", args.output]
+        if args.dry_run:
+            argv_mp4.append("--dry-run")
+        if args.slack:
+            argv_mp4.append("--slack")
+        argv_mp4 += args.mp4_opt + groups[CONTAINER_MP4]
+        try:
+            integration_mp4.main(argv_mp4)
+            results.append(("MP4", len(groups[CONTAINER_MP4]), None))
+        except SystemExit as exc:
+            results.append(("MP4", len(groups[CONTAINER_MP4]),
+                            f"integration_mp4.py가 종료 코드 {exc.code}로 중단됨"))
+        except Exception as exc:
+            results.append(("MP4", len(groups[CONTAINER_MP4]), f"예외: {exc}"))
 
 
 def main(argv=None):
@@ -269,41 +337,16 @@ def main(argv=None):
 
     results = []
 
-    if groups[CONTAINER_AVI]:
-        print(f"\n{'#' * 70}\n# AVI {len(groups[CONTAINER_AVI])}개 -> integration_avi.py\n{'#' * 70}")
-        argv_avi = ["-o", args.output]
-        if args.dry_run:
-            argv_avi.append("--dry-run")
-        if args.slack:
-            argv_avi.append("--slack")
-        argv_avi += args.avi_opt + groups[CONTAINER_AVI]
-        try:
-            integration_avi.main(argv_avi)
-            results.append(("AVI", len(groups[CONTAINER_AVI]), None))
-        except SystemExit as exc:
-            # integration_avi.assert_riff_file 등이 sys.exit을 부를 수 있다.
-            # 여기서 잡아야 뒤이은 MP4 처리가 같이 죽지 않는다.
-            results.append(("AVI", len(groups[CONTAINER_AVI]),
-                            f"integration_avi.py가 종료 코드 {exc.code}로 중단됨"))
-        except Exception as exc:
-            results.append(("AVI", len(groups[CONTAINER_AVI]), f"예외: {exc}"))
-
-    if groups[CONTAINER_MP4]:
-        print(f"\n{'#' * 70}\n# MP4 {len(groups[CONTAINER_MP4])}개 -> integration_mp4.py\n{'#' * 70}")
-        argv_mp4 = ["-o", args.output]
-        if args.dry_run:
-            argv_mp4.append("--dry-run")
-        if args.slack:
-            argv_mp4.append("--slack")
-        argv_mp4 += args.mp4_opt + groups[CONTAINER_MP4]
-        try:
-            integration_mp4.main(argv_mp4)
-            results.append(("MP4", len(groups[CONTAINER_MP4]), None))
-        except SystemExit as exc:
-            results.append(("MP4", len(groups[CONTAINER_MP4]),
-                            f"integration_mp4.py가 종료 코드 {exc.code}로 중단됨"))
-        except Exception as exc:
-            results.append(("MP4", len(groups[CONTAINER_MP4]), f"예외: {exc}"))
+    # 출력 폴더 예약은 두 모듈이 공유한다. 모듈마다 따로 두면 stem이 같은 AVI와 MP4의 결과가 한 폴더에 섞여
+    # 경고 로그가 덮였다(리뷰 #118). 각 모듈의 main()이 시작할 때 clear()를 부르므로 지워지지 않는 집합을 준다.
+    saved = (integration_avi._USED_OUT_DIRS, integration_mp4._USED_OUT_DIRS)
+    shared = _SharedReservations()
+    integration_avi._USED_OUT_DIRS = shared
+    integration_mp4._USED_OUT_DIRS = shared
+    try:
+        _run_groups(args, groups, results)
+    finally:
+        integration_avi._USED_OUT_DIRS, integration_mp4._USED_OUT_DIRS = saved
 
     print("\n" + "=" * 70)
     print("[전체 요약]")
