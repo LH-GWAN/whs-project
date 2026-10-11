@@ -82,9 +82,93 @@ def detect_container(path):
                                f"{box_type.decode('ascii', errors='replace')!r} "
                                f"- ISO BMFF 변종으로 보고 MP4로 처리")
 
+    # 앞 8바이트가 깨진 파일(앞부분 0 채움·시그니처 변조)은 내용으로 판별한다. 예전엔 여기서
+    # 거부돼 데이터가 100% 남은 파일도 분석에 들어가지 못했다(손상 시나리오: ftyp 4바이트만 0).
+    sniffed, evidence = sniff_damaged_container(path)
+    if sniffed is not None:
+        return sniffed, (f"시그니처 손상: 앞 8바이트 {head[:8]!r} - 파일 내용({evidence})으로 "
+                         f"{sniffed.upper()}로 판별")
     return None, (f"RIFF/AVI도 아니고 ISO BMFF Box로도 시작하지 않음 "
                   f"(앞 8바이트 {head[:8]!r})")
 
+
+_MP4_TOP_TYPES = {b"ftyp", b"moov", b"moof", b"mdat", b"free", b"skip", b"wide", b"styp", b"sidx"}
+
+
+def sniff_damaged_container(path, window=8 * 1024 * 1024):
+    """앞부분 시그니처가 깨진 파일의 컨테이너를 내용으로 추정한다. 반환: (container, 근거) 또는 (None, "").
+    AVI: 'LIST....hdrl' / 'LIST....movi' / 'idx1' 또는 'NNdc'·'NNwb' 청크 머리(앞 8MB).
+    MP4: 크기가 그럴듯한 Box 머리 두 개가 연달아 나오는 사슬(moov/moof/mdat/free …). 앞·뒤 8MB를 먼저
+    보고, 없으면 파일 전체를 창 단위로 훑는다(moov가 끝에 있는 일반 MP4의 앞부분이 0으로 덮인 경우)."""
+    import re
+    import struct
+    try:
+        filesize = os.path.getsize(path)
+        f = open(path, "rb")
+    except OSError:
+        return None, ""
+    with f:
+        head = f.read(window)
+        avi_hits = []
+        for pat, label in ((rb"LIST....hdrl", "hdrl"), (rb"LIST....movi", "movi"), (rb"idx1", "idx1")):
+            m = re.search(pat, head, re.S)
+            if m:
+                avi_hits.append(f"{label}@0x{m.start():X}")
+        chunk_ids = re.findall(rb"[0-9]{2}(?:dc|db|wb)", head)
+        if not avi_hits and len(chunk_ids) >= 8:
+            avi_hits.append(f"{len(chunk_ids)}개 AVI 청크 머리")
+
+        def box_end(pos):
+            if pos < 0 or pos + 8 > filesize:
+                return None
+            f.seek(pos)
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                return None
+            size = struct.unpack(">I", hdr[:4])[0]
+            kind = hdr[4:8]
+            if kind not in _MP4_TOP_TYPES:
+                return None
+            if size == 1:
+                if pos + 16 > filesize:
+                    return None
+                f.seek(pos + 8)
+                size = struct.unpack(">Q", f.read(8))[0]
+            elif size == 0:
+                size = filesize - pos if kind == b"mdat" else 0
+            if size < 8 or pos + size > filesize:
+                return None
+            return pos + size
+
+        def find_chain(start, data):
+            for m in re.finditer(rb"ftyp|moov|moof|mdat|free|skip|styp", data):
+                pos = start + m.start() - 4
+                end = box_end(pos)
+                if end is None:
+                    continue
+                if end == filesize or box_end(end) is not None:
+                    return f"Box 사슬 {data[m.start():m.start()+4].decode('ascii', 'replace')}@0x{pos:X}", pos
+            return None
+
+        mp4_hit = find_chain(0, head)
+        if mp4_hit is None and filesize > window:
+            tail_start = max(window - 8, filesize - window)
+            f.seek(tail_start)
+            mp4_hit = find_chain(tail_start, f.read(window))
+        if mp4_hit is None and filesize > 2 * window:
+            pos = window - 8
+            while pos < filesize - window and mp4_hit is None:
+                f.seek(pos)
+                mp4_hit = find_chain(pos, f.read(window + 8))
+                pos += window
+    if avi_hits and not mp4_hit:
+        return CONTAINER_AVI, ", ".join(avi_hits)
+    if mp4_hit and not avi_hits:
+        return CONTAINER_MP4, mp4_hit[0]
+    if avi_hits and mp4_hit:
+        avi_pos = int(avi_hits[0].rsplit("0x", 1)[-1], 16) if "0x" in avi_hits[0] else 0
+        return (CONTAINER_AVI if avi_pos < mp4_hit[1] else CONTAINER_MP4), f"{', '.join(avi_hits)} / {mp4_hit[0]}"
+    return None, ""
 
 def check_extension_mismatch(path, container):
     """확장자와 실제 내용이 다르면 알려준다(판별은 내용을 따른다)."""

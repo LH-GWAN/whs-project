@@ -105,6 +105,11 @@ def read_box_header(f, pos, limit, context="", allow_size_zero=False):
         size = struct.unpack(">Q", ext)[0]
         header_size = 16
     elif size32 == 0:
+        if not all(0x20 <= b < 0x7F for b in box_type):
+            # 0으로 덮인 손상 구간: size 0 + 타입 0x00000000을 '파일 끝까지 Box'로 읽으면 그 뒤의
+            # 정상 moof/mdat 전체를 버린다(손상 시나리오). 손상으로 보고 순회를 넘긴다.
+            warn(f"{context} @ 0x{pos:X}: size 0에 타입 {box_type!r} - 0으로 덮인 손상 구간으로 봄")
+            return None
         if not allow_size_zero:
             warn(f"{context} Box {box_type!r} @ 0x{pos:X}: child Box에서 size==0이 나옴 "
                  f"(비정상 - size==0은 Top-Level에서만 '끝까지'라는 뜻이어야 함)")
@@ -1050,8 +1055,11 @@ def scan_top_level_bounded(f, filesize):
     boxes = []
     last_times = {}
     pos = 0
+    DAMAGE_GAPS.clear()
     while pos < filesize:
         box = read_box_header(f, pos, filesize, context="top-level", allow_size_zero=True)
+        if box is not None and not all(0x20 <= b < 0x7F for b in box.box_type):
+            box = None
         if box is None:
             kind = "corrupt"
             if pos + 8 <= filesize:
@@ -1060,6 +1068,17 @@ def scan_top_level_bounded(f, filesize):
                 size32 = struct.unpack(">I", header[0:4])[0]
                 if all(0x20 <= b < 0x7F for b in header[4:8]) and size32 >= 8 and pos + size32 > filesize:
                     kind = "truncated"
+            if kind == "corrupt":
+                # 0으로 덮이거나 깨진 구간: 다음 정상 Box(moof/mdat/moov/ftyp…)를 찾아 이어 읽는다.
+                # 예전엔 여기서 멈춰 손상 뒤의 GPS·영상을 모두 버렸다(손상 시나리오 '중간 손상').
+                resync = resync_top_level(f, pos, filesize)
+                if resync is not None:
+                    DAMAGE_GAPS.append((pos, resync))
+                    warn(f"최상위 @ 0x{pos:X}: Box 머리를 읽을 수 없음 - 0x{resync:X}에서 재동기화 "
+                         f"({resync - pos}바이트 건너뜀)")
+                    pos = resync
+                    continue
+                DAMAGE_GAPS.append((pos, filesize))
             return boxes, pos, kind
         if box.box_type == b"ftyp" and box.start > 0:
             warn(f"최상위 @ 0x{box.start:X}: 두 번째 ftyp - 뒤는 이어붙은 옛 녹화로 보고 순회를 멈춤")
@@ -1079,6 +1098,62 @@ def scan_top_level(f, filesize):
     """현재 녹화분의 최상위 Box만(경계 뒤는 제외). 모든 경로가 이 함수를 써야 본 궤적과 슬랙이
     같은 경계를 쓴다."""
     return scan_top_level_bounded(f, filesize)[0]
+
+
+CURRENT_INPUT_PATH = None   # process_single_file이 설정. 손상 구간 GPS 카빙이 파일을 다시 연다.
+DAMAGE_GAPS = []        # [(start, end)] 최상위 순회에서 읽을 수 없어 건너뛴 구간
+UNINDEXED_MEDIA = []    # [(start, end)] 앞의 moof가 사라져 샘플 표 없이 남은 mdat 페이로드
+_TOP_SIGNATURE = re.compile(rb"moof|mdat|moov|ftyp|free|skip|styp")
+
+
+def _plausible_box_at(f, pos, filesize):
+    """pos에 그럴듯한 최상위 Box 머리가 있으면 그 Box의 끝 위치, 아니면 None."""
+    if pos < 0 or pos + 8 > filesize:
+        return None
+    f.seek(pos)
+    header = f.read(8)
+    if len(header) < 8:
+        return None
+    size32 = struct.unpack(">I", header[0:4])[0]
+    kind = header[4:8]
+    if not _TOP_SIGNATURE.fullmatch(kind):
+        return None
+    if size32 == 1:
+        if pos + 16 > filesize:
+            return None
+        f.seek(pos + 8)
+        size = struct.unpack(">Q", f.read(8))[0]
+    elif size32 == 0:
+        size = filesize - pos if kind == b"mdat" else 0
+    else:
+        size = size32
+    if size < 8 or pos + size > filesize:
+        return None
+    if kind == b"moof":
+        f.seek(pos + 8)
+        if f.read(8)[4:8] != b"mfhd":
+            return None
+    return pos + size
+
+
+def resync_top_level(f, start, filesize):
+    """start 뒤에서 '머리가 맞고 그 다음 Box 머리도 맞는(또는 파일 끝에 닿는)' 최상위 Box 위치를 찾는다."""
+    pos = start + 1
+    window = 4 * 1024 * 1024
+    while pos + 8 <= filesize:
+        f.seek(pos)
+        buf = f.read(window + 8)
+        for m in _TOP_SIGNATURE.finditer(buf):
+            cand = pos + m.start() - 4
+            if cand < start + 1:
+                continue
+            end = _plausible_box_at(f, cand, filesize)
+            if end is None:
+                continue
+            if end == filesize or _plausible_box_at(f, end, filesize) is not None:
+                return cand
+        pos += window
+    return None
 
 def format_gsensor(payload):
     lines = [f"    [GSENSOR] subtype={payload.get('subtype') or '-'}"]
@@ -1333,6 +1408,7 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
             "start_time_sec": f"{s.start_time:.3f}" if s.start_time is not None else "",
             "end_time_sec": f"{s.end_time:.3f}" if s.end_time is not None else "",
             "time_source": "tfdt_trun" if s.start_time is not None else "",
+            "source_offset": s.file_offset if s.file_offset >= 0 else "",
             "latitude": (f"{gps_payload['lat']:.6f}"
                          if gps_payload and gps_payload.get("lat") is not None else ""),
             "longitude": (f"{gps_payload['lon']:.6f}"
@@ -1367,6 +1443,11 @@ def save_outputs(out_dir, samples, all_tracks, target_track_id, dry_run=False):
             row["x_g_cal"] = sen.get("x_g_cal", "")
             row["y_g_cal"] = sen.get("y_g_cal", "")
             row["z_g_cal"] = sen.get("z_g_cal", "")
+    # moof가 사라져 샘플 표가 없는 구간·손상 구간에 남은 GPS 문장을 UTC로 시간축에 되돌려 넣는다(손상 복구).
+    carved = carve_gap_gps(CURRENT_INPUT_PATH, DAMAGE_GAPS + UNINDEXED_MEDIA, timeline_rows)
+    if carved:
+        timeline_rows.extend(carved)
+        timeline_rows.sort(key=lambda r: (r.get("start_time_sec") == "", float(r.get("start_time_sec") or 0)))
     write_csv(os.path.join(track_dir, "timeline.csv"), timeline_rows)
     with open(os.path.join(track_dir, "coordinates.txt"), "w", encoding="utf-8") as f:
         # coordinates.txt는 "좌표 목록"이라 fix가 없어 좌표가 빈 행은 제외한다
@@ -1815,6 +1896,102 @@ def sample_time_range(track_info, sample_number):
     return (None, None)
 
 
+GAP_NMEA_RE = re.compile(rb"\$?[A-Z]{2}RMC,[\x20-\x7e]{10,180}?\*[0-9A-Fa-f]{2}")
+
+
+def _utc_seconds(utc_time):
+    """'HH:MM:SS.ss'(timeline 표기) 또는 'HHMMSS.ss'(NMEA 원문) → 초."""
+    if not utc_time:
+        return None
+    text = utc_time.replace(":", "")
+    try:
+        h, m, sec = int(text[0:2]), int(text[2:4]), float(text[4:] or 0)
+    except (ValueError, TypeError):
+        return None
+    return h * 3600 + m * 60 + sec
+
+
+def carve_gap_gps(path, regions, timeline_rows):
+    """샘플 표가 사라진 구간(moof 손상·0 채움)에 남은 RMC 문장을 찾아, 가장 가까운 정상 행의
+    (재생 시각, UTC) 관계로 재생 시각을 되돌려 넣는다. time_source='gap_carved_utc'로 표시해 앱이
+    '손상 구간에서 회수'로 보이게 한다. 앵커가 없으면(정상 행에 UTC가 없음) 넣지 않는다."""
+    if not regions or not timeline_rows or not path:
+        return []
+    f = open(path, "rb")
+    try:
+        return _carve_gap_gps(f, regions, timeline_rows)
+    finally:
+        f.close()
+
+
+def _carve_gap_gps(f, regions, timeline_rows):
+    anchors = []
+    for r in timeline_rows:
+        u = _utc_seconds(r.get("gps_utc_time") or "")
+        try:
+            t = float(r.get("start_time_sec") or "")
+        except ValueError:
+            continue
+        off = r.get("source_offset")
+        if u is not None and off not in ("", None):
+            anchors.append((int(off), t, u))
+    if len(anchors) < 2:
+        return []
+    anchors.sort()
+    seen = {(r.get("gps_date", ""), r.get("gps_utc_time", "")) for r in timeline_rows if r.get("gps_utc_time")}
+    template = {k: "" for k in timeline_rows[0].keys()}
+    out = []
+    for start, end in regions:
+        pos = start
+        while pos < end:
+            f.seek(pos)
+            chunk = f.read(min(4 * 1024 * 1024, end - pos))
+            if not chunk:
+                break
+            for m in GAP_NMEA_RE.finditer(chunk):
+                raw = m.group().decode("ascii", "replace")
+                parsed = try_parse_nmea(raw if raw.startswith("$") else "$" + raw)
+                if not parsed or parsed.get("checksum_ok") is not True or not parsed.get("status_valid"):
+                    continue
+                if parsed.get("lat") is None or parsed.get("lon") is None:
+                    continue
+                key = (parsed.get("date", ""), parsed.get("utc_time", ""))
+                if key in seen:
+                    continue
+                u = _utc_seconds(parsed.get("utc_time", ""))
+                if u is None:
+                    continue
+                abs_off = pos + m.start()
+                # 가장 가까운(바이트 위치 기준) 앵커로 재생 시각을 정한다. 자정 넘김은 ±12시간으로 보정.
+                anchor = min(anchors, key=lambda a: abs(a[0] - abs_off))
+                du = u - anchor[2]
+                if du > 43200:
+                    du -= 86400
+                elif du < -43200:
+                    du += 86400
+                t = anchor[1] + du
+                if t < 0:
+                    continue
+                seen.add(key)
+                row = dict(template)
+                speed = parsed.get("speed_kmh")
+                row.update({
+                    "sample": "", "start_time_sec": f"{t:.3f}", "end_time_sec": f"{t + 1.0:.3f}",
+                    "time_source": "gap_carved_utc", "source_offset": abs_off,
+                    "latitude": f"{parsed['lat']:.6f}", "longitude": f"{parsed['lon']:.6f}",
+                    "speed_kmh": f"{speed:.3f}" if speed is not None else "",
+                    "track_deg": parsed.get("track_deg", ""), "gps_date": parsed.get("date", ""),
+                    "gps_utc_time": parsed.get("utc_time", ""), "gps_checksum_ok": True,
+                })
+                out.append(row)
+            if len(chunk) < 4 * 1024 * 1024 or pos + len(chunk) >= end:
+                break
+            pos += len(chunk) - 256   # 블록 경계에 걸친 문장을 놓치지 않게 겹쳐 읽는다
+    if out:
+        warn(f"손상 구간에서 GPS 문장 {len(out)}건을 UTC 기준으로 되돌려 넣음(gap_carved_utc)")
+    return out
+
+
 def write_timeline(track_dir, timeline_rows, sensor_rows):
     """GPS와 G센서를 sample 시간 기준으로 한 줄씩 합친 통합 타임라인.
     루트 A(fragmented)의 timeline.csv와 같은 목적/컬럼 구성이다.
@@ -1842,6 +2019,7 @@ def write_timeline(track_dir, timeline_rows, sensor_rows):
             "start_time_sec": row["start_time_sec"],
             "end_time_sec": row["end_time_sec"],
             "time_source": row["time_source"],
+            "source_offset": row.get("source_offset", ""),
             "latitude": (f"{gps['lat']:.6f}"
                          if gps and gps.get("lat") is not None else ""),
             "longitude": (f"{gps['lon']:.6f}"
@@ -2032,6 +2210,7 @@ def extract_text_track(f, filesize, track_info, out_dir, dry_run=False, do_bin_e
             "start_time_sec": _fmt_sec(start_sec),
             "end_time_sec": _fmt_sec(end_sec),
             "time_source": time_source,
+            "source_offset": offset,
             "_gps": timeline_gps,
         })
 
@@ -2306,6 +2485,14 @@ def run_fragmented(f, filesize, out_dir, args):
     if not moof_boxes:
         warn("moof Box가 하나도 없음 - fragmented MP4가 아님")
         return None
+
+    # 앞의 moof가 사라진 mdat(손상): 샘플 표가 없어 정상 경로로는 못 읽는다. GPS 문장 카빙 대상으로 남긴다.
+    UNINDEXED_MEDIA.clear()
+    for i, b in enumerate(top_boxes):
+        if b.box_type == b"mdat" and (i == 0 or top_boxes[i - 1].box_type != b"moof"):
+            UNINDEXED_MEDIA.append((b.payload_start, b.end))
+    if UNINDEXED_MEDIA:
+        warn(f"moof 없이 남은 mdat {len(UNINDEXED_MEDIA)}개 - 샘플 표 없이 GPS 문장만 UTC로 되돌려 넣음")
 
     text_tracks, trex_defaults, all_tracks = parse_moov(f, moov_boxes[0])
     if not text_tracks:
@@ -2839,6 +3026,8 @@ def unique_out_dir(output_root, input_path):
 
 
 def process_single_file(input_path, output_root, args):
+    global CURRENT_INPUT_PATH
+    CURRENT_INPUT_PATH = input_path
     WARNINGS.clear()
     info("=" * 70)
     info(f"[처리 시작] {input_path}")
